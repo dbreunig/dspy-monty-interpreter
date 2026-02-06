@@ -61,6 +61,9 @@ class MontyInterpreter:
         self._resource_limits: ResourceLimits | None = resource_limits
         self._code_history: list[str] = []
         self._call_cache: list[_CachedCall] = []
+        # Track all external function names ever used in accumulated code,
+        # so Monty always recognizes them even if tools change between calls.
+        self._ext_fn_history: set[str] = set()
 
     @property
     def tools(self) -> dict[str, Callable[..., str]]:
@@ -97,9 +100,14 @@ class MontyInterpreter:
         else:
             full_code = code
 
-        # Determine input and external function names
+        # Determine input and external function names.
+        # Include current tools, historical tools (from accumulated code),
+        # and SUBMIT. This ensures Monty recognizes all function names that
+        # appear anywhere in the accumulated + new code.
         input_names = list(variables.keys()) if variables else None
-        ext_fn_names = list(self._tools.keys()) + ["SUBMIT"]
+        ext_fn_names = list(
+            {*self._tools.keys(), *self._ext_fn_history, "SUBMIT"}
+        )
         if has_history:
             ext_fn_names.append(_BOUNDARY)
 
@@ -144,6 +152,9 @@ class MontyInterpreter:
                     # Execution finished — commit history and return
                     self._code_history.append(code)
                     self._call_cache.extend(new_calls)
+                    self._ext_fn_history.update(
+                        c.func_name for c in new_calls
+                    )
                     return _build_output(progress.output, new_print_output)
 
                 if isinstance(progress, MontySnapshot):
@@ -155,15 +166,10 @@ class MontyInterpreter:
                         progress = progress.resume(return_value=None)
                         continue
 
-                    # SUBMIT: return FinalOutput and commit history
-                    if fn_name == "SUBMIT":
-                        self._code_history.append(code)
-                        self._call_cache.extend(new_calls)
-                        return _handle_submit(
-                            progress.args, progress.kwargs, self.output_fields
-                        )
-
-                    # Tool call during replay: use cached result
+                    # During replay: use cached results for ALL external
+                    # calls (tools AND SUBMIT). This avoids re-calling
+                    # tools (e.g. llm_query) and re-triggering SUBMIT
+                    # from previously accumulated code.
                     if in_replay[0] and replay_index < total_cached:
                         cached = self._call_cache[replay_index]
                         replay_index += 1
@@ -172,6 +178,23 @@ class MontyInterpreter:
                         else:
                             progress = progress.resume(return_value=cached.result)
                         continue
+
+                    # Live SUBMIT: return FinalOutput and commit history
+                    if fn_name == "SUBMIT":
+                        # Cache the SUBMIT so it can be replayed in future
+                        # execute() calls (resumed with None to continue
+                        # past it during replay).
+                        new_calls.append(
+                            _CachedCall(func_name="SUBMIT", result=None)
+                        )
+                        self._code_history.append(code)
+                        self._call_cache.extend(new_calls)
+                        self._ext_fn_history.update(
+                            c.func_name for c in new_calls
+                        )
+                        return _handle_submit(
+                            progress.args, progress.kwargs, self.output_fields
+                        )
 
                     # Live tool call
                     if fn_name in self._tools:
@@ -202,6 +225,7 @@ class MontyInterpreter:
     def shutdown(self) -> None:
         self._code_history.clear()
         self._call_cache.clear()
+        self._ext_fn_history.clear()
         self._tools_registered = False
 
     def __enter__(self) -> MontyInterpreter:

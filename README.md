@@ -1,4 +1,6 @@
-# dspy-monty-interpreter
+# dspy-monty-interpreter (pre-release!)
+
+**This code interpreter has issues, some due to Monty coverage and some due to how state is being persisted across calls.**
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
