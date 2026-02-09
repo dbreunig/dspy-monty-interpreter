@@ -386,3 +386,31 @@ def test_ext_fn_history_survives_tool_changes():
     # even though tools dict was cleared and rebuilt
     result = interp.execute("print(a)")
     assert result == "v1"
+
+
+# --- Code fence stripping ---
+
+
+def test_strip_python_code_fence():
+    interp = MontyInterpreter()
+    result = interp.execute("```python\n1 + 2\n```")
+    assert result == "3"
+
+
+def test_strip_py_code_fence():
+    interp = MontyInterpreter()
+    result = interp.execute("```py\n1 + 2\n```")
+    assert result == "3"
+
+
+def test_strip_bare_code_fence():
+    interp = MontyInterpreter()
+    result = interp.execute("```\n1 + 2\n```")
+    assert result == "3"
+
+
+def test_no_strip_inline_backticks():
+    """Backticks that aren't wrapping the entire code should be left alone."""
+    interp = MontyInterpreter()
+    result = interp.execute("x = 'hello'\nprint(x)")
+    assert result == "hello"

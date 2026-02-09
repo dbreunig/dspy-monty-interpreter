@@ -1,0 +1,116 @@
+name: Check for new Monty releases
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 9am UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest Monty release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view --repo pydantic/monty --json tagName,body --jq '.tagName' > /tmp/new_tag.txt
+          gh release view --repo pydantic/monty --json tagName,body --jq '.body' > /tmp/release_notes.txt
+          echo "tag=$(cat /tmp/new_tag.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with known version
+        id: compare
+        run: |
+          KNOWN_TAG=$(cat .github/monty-version.txt | tr -d '[:space:]')
+          NEW_TAG=$(cat /tmp/new_tag.txt | tr -d '[:space:]')
+          echo "known=$KNOWN_TAG" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          if [ "$KNOWN_TAG" = "$NEW_TAG" ]; then
+            echo "No new Monty release (still $KNOWN_TAG)"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Monty release: $KNOWN_TAG -> $NEW_TAG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract our Monty API usage
+        if: steps.compare.outputs.changed == 'true'
+        id: usage
+        run: |
+          {
+            echo 'api_usage<<USAGE_EOF'
+            echo '### Imports'
+            echo '```python'
+            grep -E '^from pydantic_monty|^import pydantic_monty' src/dspy_monty_interpreter/interpreter.py
+            echo '```'
+            echo ''
+            echo '### Key API calls'
+            echo '```'
+            grep -nE 'Monty\(|\.start\(|\.resume\(|\.output|\.function_name|\.args|\.kwargs|\.display\(|ResourceLimits|MontySyntaxError|MontyRuntimeError|MontyComplete|MontySnapshot|MontyFutureSnapshot' src/dspy_monty_interpreter/interpreter.py
+            echo '```'
+            echo 'USAGE_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open GitHub issue
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KNOWN_TAG: ${{ steps.compare.outputs.known }}
+          NEW_TAG: ${{ steps.compare.outputs.new }}
+          API_USAGE: ${{ steps.usage.outputs.api_usage }}
+        run: |
+          RELEASE_NOTES=$(cat /tmp/release_notes.txt)
+          DIFF_URL="https://github.com/pydantic/monty/compare/${KNOWN_TAG}...${NEW_TAG}"
+
+          gh issue create \
+            --title "Upstream: pydantic-monty ${NEW_TAG} released" \
+            --label "dependencies" \
+            --body "$(cat <<EOF
+          ## New Monty Release: ${NEW_TAG}
+
+          A new version of \`pydantic-monty\` has been released upstream.
+
+          - **Previous version:** ${KNOWN_TAG}
+          - **New version:** ${NEW_TAG}
+          - **Full diff:** [${KNOWN_TAG}...${NEW_TAG}](${DIFF_URL})
+
+          ### Release Notes
+
+          ${RELEASE_NOTES}
+
+          ## Our Current Monty API Surface
+
+          ${API_USAGE}
+
+          ## Verification Checklist
+
+          - [ ] Review release notes for breaking changes
+          - [ ] Check import paths (\`pydantic_monty\` module)
+          - [ ] Verify \`Monty()\` constructor signature (code, inputs, external_functions)
+          - [ ] Verify \`.start()\` signature (inputs, limits, print_callback)
+          - [ ] Verify \`.resume()\` signature (return_value, exception)
+          - [ ] Check \`MontySnapshot\` / \`MontyComplete\` / \`MontyFutureSnapshot\` types
+          - [ ] Check \`MontySyntaxError\` / \`MontyRuntimeError\` exception types
+          - [ ] Verify \`ResourceLimits\` API
+          - [ ] Run test suite against new version: \`pip install pydantic-monty==${NEW_TAG#v} && pytest\`
+          - [ ] Update \`pyproject.toml\` dependency pin if needed
+          EOF
+          )"
+
+      - name: Update known version
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          NEW_TAG: ${{ steps.compare.outputs.new }}
+        run: |
+          echo "$NEW_TAG" > .github/monty-version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/monty-version.txt
+          git commit -m "chore: update known Monty version to ${NEW_TAG}"
+          git push

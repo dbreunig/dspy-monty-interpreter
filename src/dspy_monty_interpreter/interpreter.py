@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -18,6 +19,12 @@ from pydantic_monty import (
 
 # Sentinel external function name used to separate replayed code from new code.
 _BOUNDARY = "__mci_boundary__"
+
+# Matches markdown code fences wrapping the entire code string.
+_CODE_FENCE_RE = re.compile(
+    r"^\s*```(?:\s*(?:python|py)\s*)?\n(.*?)```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 @dataclass
@@ -91,6 +98,7 @@ class MontyInterpreter:
             SyntaxError: On syntax errors.
         """
         variables = variables or {}
+        code = _strip_code_fences(code)
 
         # Build combined code: old blocks + boundary + new code
         has_history = len(self._code_history) > 0
@@ -269,6 +277,14 @@ def _call_tool(
         cached = _CachedCall(func_name=fn_name, result=result)
         progress = snapshot.resume(return_value=result)
     return progress, cached
+
+
+def _strip_code_fences(code: str) -> str:
+    """Remove markdown code fences wrapping the entire code string."""
+    m = _CODE_FENCE_RE.match(code)
+    if m:
+        return m.group(1)
+    return code
 
 
 def _build_output(output: Any, print_output: list[str]) -> Any:
