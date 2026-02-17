@@ -128,6 +128,8 @@ class MontyInterpreter:
             )
         except MontySyntaxError as e:
             raise SyntaxError(str(e)) from e
+        except MontyRuntimeError as e:
+            raise CodeInterpreterError(e.display("type-msg")) from e
 
         # Print callback that suppresses output during replay
         in_replay = [has_history]
