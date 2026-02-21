@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "dspy>=3.0",
-    "pydantic-monty>=0.0.5",
+    "pydantic-monty>=0.0.7",
 ]
 
 [project.optional-dependencies]
