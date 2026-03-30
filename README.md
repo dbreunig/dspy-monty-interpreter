@@ -2,7 +2,9 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty is still building out support for many standard Python libraries, including (crucially) `json`. That said: it's *fast*.
+The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`) and can't yet define classes or use match statements. 
+
+That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
 ## Installation
 
