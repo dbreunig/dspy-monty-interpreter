@@ -528,3 +528,43 @@ def test_partial_mutation_persists_on_error():
         interp.execute("x = 99\n1/0")  # x is set before the error
     result = interp.execute("x")
     assert result == "99"  # not reverted to 1
+
+
+# --- Tool callbacks ---
+
+
+def test_tool_callback_fires():
+    """Tool invocation fires on_tool_start and on_tool_end callbacks."""
+    import dspy
+    from dspy.utils.callback import BaseCallback
+
+    events = []
+
+    class Recorder(BaseCallback):
+        def on_tool_start(self, call_id, instance, inputs):
+            events.append(("start", call_id, instance.name, inputs))
+
+        def on_tool_end(self, call_id, outputs, exception=None):
+            events.append(("end", call_id, outputs, exception))
+
+    def search(query: str) -> str:
+        return f"result for {query}"
+
+    interp = MontyInterpreter(tools={"search": search})
+
+    with dspy.context(callbacks=[Recorder()]):
+        result = interp.execute('search(query="python")')
+
+    assert result == "result for python"
+    assert len(events) == 2
+
+    kind, start_id, name, inputs = events[0]
+    assert kind == "start"
+    assert name == "search"
+    assert inputs == {"query": "python"}
+
+    kind, end_id, outputs, exc = events[1]
+    assert kind == "end"
+    assert end_id == start_id
+    assert outputs == "result for python"
+    assert exc is None

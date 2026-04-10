@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import uuid
 from typing import Any, Callable, Literal
 
+import dspy
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
+from dspy.utils.callback import ACTIVE_CALL_ID
 from pydantic_monty import (
     MontyRepl,
     MontyRuntimeError,
@@ -55,9 +59,51 @@ class MontyInterpreter:
         self._mounts: MountDirectory | list[MountDirectory] | None = mounts
         self._repl: MontyRepl = self._new_repl()
         self._has_state: bool = False
+        self._tool_instances: dict[str, dspy.Tool] = {}
 
     def _new_repl(self) -> MontyRepl:
         return MontyRepl(limits=self._resource_limits)
+
+    def _wrap_tool_with_callbacks(self, name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap a tool function to fire DSPy on_tool_start/on_tool_end callbacks."""
+        def wrapper(**kwargs: Any) -> Any:
+            callbacks = dspy.settings.get("callbacks", [])
+            if not callbacks:
+                return fn(**kwargs)
+
+            # Lazily build and cache a Tool instance for this function
+            if name not in self._tool_instances:
+                self._tool_instances[name] = dspy.Tool(fn, name=name)
+            tool_instance = self._tool_instances[name]
+
+            call_id = uuid.uuid4().hex
+
+            for cb in callbacks:
+                try:
+                    cb.on_tool_start(call_id=call_id, instance=tool_instance, inputs=kwargs)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Callback error on tool start: {e}")
+
+            parent_call_id = ACTIVE_CALL_ID.get()
+            ACTIVE_CALL_ID.set(call_id)
+
+            result = None
+            exception = None
+            try:
+                result = fn(**kwargs)
+                return result
+            except Exception as e:
+                exception = e
+                raise
+            finally:
+                ACTIVE_CALL_ID.set(parent_call_id)
+                for cb in callbacks:
+                    try:
+                        cb.on_tool_end(call_id=call_id, outputs=result, exception=exception)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(f"Callback error on tool end: {e}")
+
+        return wrapper
 
     @property
     def tools(self) -> dict[str, Callable[..., str]]:
@@ -114,9 +160,10 @@ class MontyInterpreter:
             submit_box.append((args, kwargs))
 
         external_fns: dict[str, Callable[..., Any]] = {
-            **self._tools,
-            "SUBMIT": submit_fn,
+            name: self._wrap_tool_with_callbacks(name, fn)
+            for name, fn in self._tools.items()
         }
+        external_fns["SUBMIT"] = submit_fn
 
         try:
             result = self._repl.feed_run(
