@@ -3,31 +3,16 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from pydantic_monty import (
-    FunctionSnapshot,
-    FutureSnapshot,
-    Monty,
-    MontyComplete,
+    MontyRepl,
     MontyRuntimeError,
     MontySyntaxError,
-    NameLookupSnapshot,
+    MountDirectory,
     ResourceLimits,
 )
-
-# Sentinel external function name used to separate replayed code from new code.
-_BOUNDARY = "__mci_boundary__"
-
-
-def _submit_placeholder(*args: Any, **kwargs: Any) -> None:
-    """Placeholder provided to the VM for SUBMIT name lookups."""
-
-
-def _boundary_placeholder() -> None:
-    """Placeholder provided to the VM for boundary name lookups."""
 
 # Matches markdown code fences wrapping the entire code string.
 _CODE_FENCE_RE = re.compile(
@@ -36,27 +21,18 @@ _CODE_FENCE_RE = re.compile(
 )
 
 
-@dataclass
-class _CachedCall:
-    """A cached external function call result from a previous execution."""
-
-    func_name: str
-    result: Any = None
-    exception: BaseException | None = None
-
-
 class MontyInterpreter:
     """DSPy CodeInterpreter implementation backed by Monty.
 
     Monty is a secure Python interpreter written in Rust. Unlike the default
     PythonInterpreter (Deno/Pyodide), Monty starts in microseconds, has no
-    subprocess overhead, and provides strict sandboxing with no filesystem,
-    network, or environment access.
+    subprocess overhead, and provides strict sandboxing with no network or
+    environment access. Filesystem access can be enabled per-interpreter via
+    the ``mounts`` parameter.
 
-    State persists across execute() calls via code accumulation: each call
-    re-executes all prior successful code blocks with cached tool results,
-    then runs the new code. A boundary marker separates replay from live
-    execution so that prints and tool calls from prior blocks are suppressed.
+    State persists across ``execute()`` calls via ``MontyRepl``, Monty's
+    built-in incremental REPL — each snippet is compiled and run against
+    the persistent heap and namespace without replaying prior snippets.
 
     Usage with RLM::
 
@@ -70,13 +46,18 @@ class MontyInterpreter:
         tools: dict[str, Callable[..., str]] | None = None,
         output_fields: list[dict] | None = None,
         resource_limits: ResourceLimits | None = None,
+        mounts: MountDirectory | list[MountDirectory] | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
         self.__tools_registered: bool = False
         self._resource_limits: ResourceLimits | None = resource_limits
-        self._code_history: list[str] = []
-        self._call_cache: list[_CachedCall] = []
+        self._mounts: MountDirectory | list[MountDirectory] | None = mounts
+        self._repl: MontyRepl = self._new_repl()
+        self._has_state: bool = False
+
+    def _new_repl(self) -> MontyRepl:
+        return MontyRepl(limits=self._resource_limits)
 
     @property
     def tools(self) -> dict[str, Callable[..., str]]:
@@ -84,20 +65,16 @@ class MontyInterpreter:
 
     # RLM sets ``_tools_registered = False`` via _inject_execution_context at
     # the start of every forward() call.  We intercept that write so we can
-    # automatically clear accumulated Monty state between RLM runs.
+    # automatically clear REPL state between RLM runs.
     @property  # type: ignore[override]
     def _tools_registered(self) -> bool:
         return self.__tools_registered
 
     @_tools_registered.setter
     def _tools_registered(self, value: bool) -> None:
-        # Reset state when RLM signals a new forward() call.  RLM always
-        # sets _tools_registered = False at the start of each run.  We only
-        # reset when there is accumulated state to clear (i.e. code has been
-        # executed since the last reset).
-        if not value and self._code_history:
-            self._code_history.clear()
-            self._call_cache.clear()
+        if not value and self._has_state:
+            self._repl = self._new_repl()
+            self._has_state = False
         self.__tools_registered = value
 
     def start(self) -> None:
@@ -110,8 +87,8 @@ class MontyInterpreter:
     ) -> Any:
         """Execute Python code and return the result.
 
-        State from prior successful execute() calls is preserved by
-        re-executing accumulated code with cached tool results.
+        State from prior successful execute() calls is preserved via
+        ``MontyRepl``'s persistent heap and namespace.
 
         Returns:
             FinalOutput if SUBMIT() was called, str for print output,
@@ -124,141 +101,52 @@ class MontyInterpreter:
         variables = variables or {}
         code = _strip_code_fences(code)
 
-        # Build combined code: old blocks + boundary + new code
-        has_history = len(self._code_history) > 0
-        if has_history:
-            old_code = "\n".join(self._code_history)
-            full_code = f"{old_code}\n{_BOUNDARY}()\n{code}"
-        else:
-            full_code = code
-
-        # Determine input names.
-        input_names = list(variables.keys()) if variables else None
-
-        # Parse code (v0.0.8+: external functions are auto-detected)
-        try:
-            m = Monty(
-                full_code,
-                inputs=input_names,
-            )
-        except MontySyntaxError as e:
-            raise SyntaxError(str(e)) from e
-        except MontyRuntimeError as e:
-            raise CodeInterpreterError(e.display("type-msg")) from e
-
-        # Print callback that suppresses output during replay
-        in_replay = [has_history]
-        new_print_output: list[str] = []
+        print_output: list[str] = []
 
         def print_callback(_stream: Literal["stdout"], text: str) -> None:
-            if not in_replay[0]:
-                new_print_output.append(text)
+            print_output.append(text)
 
-        # Start execution
+        # SUBMIT captures its args into a box and returns None so the VM
+        # continues executing any code after the SUBMIT() call.
+        submit_box: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def submit_fn(*args: Any, **kwargs: Any) -> None:
+            submit_box.append((args, kwargs))
+
+        external_fns: dict[str, Callable[..., Any]] = {
+            **self._tools,
+            "SUBMIT": submit_fn,
+        }
+
         try:
-            progress = m.start(
+            result = self._repl.feed_run(
+                code,
                 inputs=variables if variables else None,
-                limits=self._resource_limits,
+                external_functions=external_fns,
                 print_callback=print_callback,
+                mount=self._mounts,
             )
         except MontySyntaxError as e:
             raise SyntaxError(str(e)) from e
         except MontyRuntimeError as e:
+            # If SUBMIT was called before the error, honor it.
+            if submit_box:
+                self._has_state = True
+                args, kwargs = submit_box[0]
+                return _handle_submit(args, kwargs, self.output_fields)
             raise CodeInterpreterError(e.display("type-msg")) from e
 
-        # Start/resume loop
-        replay_index = 0
-        total_cached = len(self._call_cache)
-        new_calls: list[_CachedCall] = []
+        self._has_state = True
 
-        try:
-            while True:
-                if isinstance(progress, MontyComplete):
-                    # Execution finished — commit history and return
-                    self._code_history.append(code)
-                    self._call_cache.extend(new_calls)
-                    return _build_output(progress.output, new_print_output)
+        if submit_box:
+            args, kwargs = submit_box[0]
+            return _handle_submit(args, kwargs, self.output_fields)
 
-                if isinstance(progress, NameLookupSnapshot):
-                    # v0.0.8+: VM pauses on unknown names. Provide the
-                    # tool function if we have it, otherwise let the VM
-                    # raise NameError.
-                    name = progress.variable_name
-                    if name in self._tools:
-                        progress = progress.resume(value=self._tools[name])
-                    elif name == "SUBMIT":
-                        progress = progress.resume(value=_submit_placeholder)
-                    elif name == _BOUNDARY:
-                        progress = progress.resume(value=_boundary_placeholder)
-                    else:
-                        progress = progress.resume()  # raises NameError in VM
-                    continue
-
-                if isinstance(progress, FunctionSnapshot):
-                    fn_name = progress.function_name
-
-                    # Boundary marker: switch from replay to live
-                    if fn_name == _BOUNDARY:
-                        in_replay[0] = False
-                        progress = progress.resume(return_value=None)
-                        continue
-
-                    # During replay: use cached results for ALL external
-                    # calls (tools AND SUBMIT). This avoids re-calling
-                    # tools (e.g. llm_query) and re-triggering SUBMIT
-                    # from previously accumulated code.
-                    if in_replay[0] and replay_index < total_cached:
-                        cached = self._call_cache[replay_index]
-                        replay_index += 1
-                        if cached.exception is not None:
-                            progress = progress.resume(exception=cached.exception)
-                        else:
-                            progress = progress.resume(return_value=cached.result)
-                        continue
-
-                    # Live SUBMIT: return FinalOutput and commit history
-                    if fn_name == "SUBMIT":
-                        # Cache the SUBMIT so it can be replayed in future
-                        # execute() calls (resumed with None to continue
-                        # past it during replay).
-                        new_calls.append(
-                            _CachedCall(func_name="SUBMIT", result=None)
-                        )
-                        self._code_history.append(code)
-                        self._call_cache.extend(new_calls)
-                        return _handle_submit(
-                            progress.args, progress.kwargs, self.output_fields
-                        )
-
-                    # Live tool call
-                    if fn_name in self._tools:
-                        progress, call = _call_tool(
-                            progress, fn_name, self._tools[fn_name]
-                        )
-                        new_calls.append(call)
-                        continue
-
-                    # Unknown function
-                    exc = NameError(f"Unknown function: {fn_name}")
-                    progress = progress.resume(exception=exc)
-                    continue
-
-                if isinstance(progress, FutureSnapshot):
-                    raise CodeInterpreterError(
-                        "Async execution is not supported by MontyInterpreter."
-                    )
-
-                raise CodeInterpreterError(
-                    f"Unexpected Monty progress type: {type(progress)}"
-                )
-
-        except MontyRuntimeError as e:
-            # Don't commit failed code to history
-            raise CodeInterpreterError(e.display("type-msg")) from e
+        return _build_output(result, print_output)
 
     def shutdown(self) -> None:
-        self._code_history.clear()
-        self._call_cache.clear()
+        self._repl = self._new_repl()
+        self._has_state = False
         self.__tools_registered = False
 
     def __enter__(self) -> MontyInterpreter:
@@ -285,23 +173,6 @@ def _handle_submit(
     if len(args) == 0:
         return FinalOutput(None)
     return FinalOutput(args[0])
-
-
-def _call_tool(
-    snapshot: FunctionSnapshot,
-    fn_name: str,
-    tool_fn: Callable[..., str],
-) -> tuple[FunctionSnapshot | FutureSnapshot | MontyComplete, _CachedCall]:
-    """Call a host-side tool and resume execution."""
-    try:
-        result = tool_fn(*snapshot.args, **snapshot.kwargs)
-    except Exception as exc:
-        cached = _CachedCall(func_name=fn_name, exception=exc)
-        progress = snapshot.resume(exception=exc)
-    else:
-        cached = _CachedCall(func_name=fn_name, result=result)
-        progress = snapshot.resume(return_value=result)
-    return progress, cached
 
 
 def _strip_code_fences(code: str) -> str:

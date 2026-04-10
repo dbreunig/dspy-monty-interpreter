@@ -12,6 +12,8 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
+Requires `pydantic-monty>=0.0.10`.
+
 ## Usage
 
 ```python
@@ -46,8 +48,31 @@ interp = MontyInterpreter(tools={"lookup": lookup})
 interp.execute('result = lookup(key="foo")\nprint(result)')
 ```
 
+### Filesystem mounts
+
+Filesystem access is disabled by default. Use `mounts=` to expose a host
+directory to sandboxed code under a virtual path:
+
+```python
+from dspy_monty_interpreter import MontyInterpreter, MountDirectory
+
+# Read-only mount: sandbox can read but not write
+interp = MontyInterpreter(
+    mounts=MountDirectory("/data", "/host/path/to/data", mode="read-only")
+)
+interp.execute("from pathlib import Path\nPath('/data/input.csv').read_text()")
+
+# Overlay mount: reads fall through to host; writes stay in memory
+interp = MontyInterpreter(
+    mounts=MountDirectory("/work", "/host/project", mode="overlay")
+)
+```
+
+Modes: `"read-only"`, `"read-write"`, `"overlay"`. Pass a list of
+`MountDirectory` for multiple mount points.
+
 ## Why Monty?
 
 - **Fast**: Microsecond startup (no subprocess, no WASM bootstrap)
-- **Secure**: No filesystem, network, or environment access by default
+- **Secure**: No network or environment access; filesystem access is opt-in via mounts
 - **Lightweight**: Pure Rust, no Deno/Pyodide dependency

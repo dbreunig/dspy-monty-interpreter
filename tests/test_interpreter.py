@@ -3,7 +3,7 @@
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
 
-from dspy_monty_interpreter import MontyInterpreter
+from dspy_monty_interpreter import MontyInterpreter, MountDirectory
 
 
 # --- Protocol conformance ---
@@ -166,7 +166,7 @@ def test_tool_error_caught_by_code():
     assert result == "caught"
 
 
-# --- Tool call caching during replay ---
+# --- Tool isolation across calls ---
 
 
 def test_tool_called_once_across_accumulations():
@@ -180,7 +180,8 @@ def test_tool_called_once_across_accumulations():
     interp.execute('a = counted_tool(x="first")')
     assert call_count[0] == 1
 
-    # Second execute replays the first tool call from cache
+    # MontyRepl persists the bound value of `a` natively — the earlier
+    # tool call is not re-invoked because old code never re-runs.
     result = interp.execute("print(a)")
     assert call_count[0] == 1  # NOT called again
     assert result == "result_1"
@@ -198,12 +199,11 @@ def test_tool_caching_with_new_calls():
     assert call_log == ["first"]
 
     interp.execute('b = my_tool(x="second")')
-    # "first" should NOT be re-called (cached), only "second" is new
+    # "first" is not re-called — MontyRepl persists `a` natively.
     assert call_log == ["first", "second"]
 
     result = interp.execute("print(a + ' ' + b)")
     assert result == "got_first got_second"
-    # Still only 2 total live calls
     assert call_log == ["first", "second"]
 
 
@@ -244,13 +244,16 @@ def test_name_error():
 
 
 def test_failed_code_not_accumulated():
+    """MontyRepl preserves partial mutations from failed snippets (Python REPL
+    semantics). In this test the error occurs before any mutation, so x is
+    unchanged. Note: if the snippet were 'x = 99\\n1/0', x would be 99 after
+    the failure — unlike the old replay architecture which would revert to 10."""
     interp = MontyInterpreter()
     interp.execute("x = 10")
 
     with pytest.raises(CodeInterpreterError):
         interp.execute("undefined_var")
 
-    # x should still be accessible — failed code was not accumulated
     result = interp.execute("x + 5")
     assert result == "15"
 
@@ -330,11 +333,12 @@ def test_shutdown_clears_state():
         interp.execute("x")
 
 
-# --- Cross-forward() / SUBMIT replay ---
+# --- Cross-forward() / SUBMIT persistence ---
 
 
 def test_submit_replay_does_not_retrigger():
-    """After SUBMIT, a new execute() should replay past the old SUBMIT."""
+    """After SUBMIT, a new execute() picks up native REPL state without
+    re-triggering the old SUBMIT. State simply persists — there is no replay."""
     call_count = [0]
 
     def my_tool(prompt: str) -> str:
@@ -351,15 +355,16 @@ def test_submit_replay_does_not_retrigger():
     assert isinstance(result, FinalOutput)
     assert result.output == {"answer": "response_1"}
 
-    # Simulate forward() #2: state should persist, SUBMIT should be replayed
-    # (not re-triggered), and new code should run.
+    # Simulate forward() #2: state still persists, and new code runs against
+    # that state with no re-execution of prior snippets.
     result2 = interp.execute('new_data = my_tool(prompt="q2")\nprint(data + " " + new_data)')
-    assert call_count[0] == 2  # Only 1 new live call (q2), q1 was cached
+    assert call_count[0] == 2
     assert result2 == "response_1 response_2"
 
 
 def test_tool_not_recalled_after_submit():
-    """Tool calls before SUBMIT should be cached and not re-invoked."""
+    """Old tools are not re-invoked because MontyRepl persists state natively
+    (not because they are cached)."""
     call_log = []
 
     def llm_query(prompt: str) -> str:
@@ -373,9 +378,9 @@ def test_tool_not_recalled_after_submit():
     interp.execute("SUBMIT(answer=x)")
     assert call_log == ["first"]
 
-    # forward() #2 — old llm_query should NOT be re-called
+    # forward() #2 — old llm_query call never happens; only "second" is new.
     result = interp.execute('y = llm_query(prompt="second")\nprint(x + " " + y)')
-    assert call_log == ["first", "second"]  # Only "second" is new
+    assert call_log == ["first", "second"]
     assert result == "answer_for_first answer_for_second"
 
 
@@ -393,7 +398,7 @@ def test_state_persists_across_submit_boundaries():
 
 
 def test_tool_changes_between_calls():
-    """Accumulated code still works when tools dict is replaced between calls."""
+    """Persisted state still works when tools dict is replaced between calls."""
     def tool_v1(x: str) -> str:
         return "v1"
 
@@ -408,8 +413,8 @@ def test_tool_changes_between_calls():
     interp._tools["my_tool"] = tool_v2
     interp._tools["new_tool"] = lambda: "new"
 
-    # Old code references my_tool — v0.0.8+ auto-detects external
-    # functions so this should still work
+    # Old code never re-runs under MontyRepl, so `a` retains v1's return value
+    # regardless of the new tool mapping.
     result = interp.execute("print(a)")
     assert result == "v1"
 
@@ -440,3 +445,86 @@ def test_no_strip_inline_backticks():
     interp = MontyInterpreter()
     result = interp.execute("x = 'hello'\nprint(x)")
     assert result == "hello"
+
+
+# --- Filesystem mounts ---
+
+
+def test_mount_read_only():
+    """Sandboxed code can read files from a read-only mount."""
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        Path(tmpdir, "data.txt").write_text("hello from mount")
+        interp = MontyInterpreter(
+            mounts=MountDirectory("/data", tmpdir, mode="read-only")
+        )
+        result = interp.execute(
+            "from pathlib import Path\nPath('/data/data.txt').read_text()"
+        )
+        assert result == "hello from mount"
+
+
+def test_mount_overlay_write():
+    """Overlay mount captures writes in memory without modifying the host."""
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        Path(tmpdir, "original.txt").write_text("original")
+        interp = MontyInterpreter(
+            mounts=MountDirectory("/data", tmpdir, mode="overlay")
+        )
+        interp.execute(
+            "from pathlib import Path\nPath('/data/new.txt').write_text('created')"
+        )
+        result = interp.execute("Path('/data/new.txt').read_text()")
+        assert result == "created"
+        # Host filesystem not modified
+        assert not Path(tmpdir, "new.txt").exists()
+
+
+def test_mount_read_only_blocks_write():
+    """Read-only mount rejects write operations."""
+    import tempfile
+    interp = MontyInterpreter(
+        mounts=MountDirectory("/data", tempfile.mkdtemp(), mode="read-only")
+    )
+    with pytest.raises(CodeInterpreterError):
+        interp.execute(
+            "from pathlib import Path\nPath('/data/file.txt').write_text('x')"
+        )
+
+
+def test_mount_persists_across_executes():
+    """Overlay state persists across execute() calls."""
+    import tempfile
+    interp = MontyInterpreter(
+        mounts=MountDirectory("/data", tempfile.mkdtemp(), mode="overlay")
+    )
+    interp.execute(
+        "from pathlib import Path\nPath('/data/state.txt').write_text('persisted')"
+    )
+    result = interp.execute("Path('/data/state.txt').read_text()")
+    assert result == "persisted"
+
+
+# --- SUBMIT / error edge cases ---
+
+
+def test_submit_honored_despite_post_submit_error():
+    """If code calls SUBMIT then later errors, SUBMIT result is still returned."""
+    interp = MontyInterpreter()
+    result = interp.execute('SUBMIT(answer="got it")\n1/0')
+    assert isinstance(result, FinalOutput)
+    assert result.output == {"answer": "got it"}
+
+
+def test_partial_mutation_persists_on_error():
+    """MontyRepl preserves partial mutations from failed snippets,
+    matching Python REPL semantics."""
+    interp = MontyInterpreter()
+    interp.execute("x = 1")
+    with pytest.raises(CodeInterpreterError):
+        interp.execute("x = 99\n1/0")  # x is set before the error
+    result = interp.execute("x")
+    assert result == "99"  # not reverted to 1
