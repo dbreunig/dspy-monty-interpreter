@@ -642,3 +642,38 @@ def test_tool_no_callbacks_fast_path():
     result = interp.execute('my_tool(x="test")')
     assert result == "ok"
     assert call_log == ["test"]
+
+
+def test_tool_callback_cache_updates_on_tool_change():
+    """Cached Tool instances update when the underlying function changes."""
+    import dspy
+    from dspy.utils.callback import BaseCallback
+
+    instances = []
+
+    class Recorder(BaseCallback):
+        def on_tool_start(self, call_id, instance, inputs):
+            instances.append(instance)
+
+        def on_tool_end(self, call_id, outputs, exception=None):
+            pass
+
+    def tool_v1(x: str) -> str:
+        return "v1"
+
+    def tool_v2(x: str) -> str:
+        return "v2"
+
+    interp = MontyInterpreter(tools={"my_tool": tool_v1})
+
+    with dspy.context(callbacks=[Recorder()]):
+        interp.execute('my_tool(x="a")')
+
+        # Replace tool (as RLM does between forward() calls)
+        interp._tools["my_tool"] = tool_v2
+        interp._tool_instances.clear()
+        interp.execute('my_tool(x="b")')
+
+    assert len(instances) == 2
+    assert instances[0].func is tool_v1
+    assert instances[1].func is tool_v2

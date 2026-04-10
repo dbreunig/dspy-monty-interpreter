@@ -121,6 +121,8 @@ class MontyInterpreter:
         if not value and self._has_state:
             self._repl = self._new_repl()
             self._has_state = False
+        if not value:
+            self._tool_instances.clear()
         self.__tools_registered = value
 
     def start(self) -> None:
@@ -194,6 +196,7 @@ class MontyInterpreter:
     def shutdown(self) -> None:
         self._repl = self._new_repl()
         self._has_state = False
+        self._tool_instances.clear()
         self.__tools_registered = False
 
     def __enter__(self) -> MontyInterpreter:
