@@ -568,3 +568,77 @@ def test_tool_callback_fires():
     assert end_id == start_id
     assert outputs == "result for python"
     assert exc is None
+
+
+def test_tool_callback_fires_on_error():
+    """on_tool_end fires with exception when tool raises."""
+    import dspy
+    from dspy.utils.callback import BaseCallback
+
+    events = []
+
+    class Recorder(BaseCallback):
+        def on_tool_start(self, call_id, instance, inputs):
+            events.append(("start", call_id))
+
+        def on_tool_end(self, call_id, outputs, exception=None):
+            events.append(("end", call_id, outputs, exception))
+
+    def bad_tool() -> str:
+        raise ValueError("boom")
+
+    interp = MontyInterpreter(tools={"bad_tool": bad_tool})
+
+    with dspy.context(callbacks=[Recorder()]):
+        with pytest.raises(CodeInterpreterError):
+            interp.execute("bad_tool()")
+
+    assert len(events) == 2
+    assert events[0][0] == "start"
+    assert events[1][0] == "end"
+    assert events[1][2] is None  # outputs
+    assert isinstance(events[1][3], ValueError)  # exception
+
+
+def test_tool_callback_sets_active_call_id():
+    """ACTIVE_CALL_ID is set during tool execution."""
+    import dspy
+    from dspy.utils.callback import ACTIVE_CALL_ID, BaseCallback
+
+    captured_ids = []
+
+    class Recorder(BaseCallback):
+        def on_tool_start(self, call_id, instance, inputs):
+            pass
+
+        def on_tool_end(self, call_id, outputs, exception=None):
+            pass
+
+    def spy_tool() -> str:
+        captured_ids.append(ACTIVE_CALL_ID.get())
+        return "ok"
+
+    interp = MontyInterpreter(tools={"spy_tool": spy_tool})
+
+    with dspy.context(callbacks=[Recorder()]):
+        interp.execute("spy_tool()")
+
+    assert len(captured_ids) == 1
+    assert captured_ids[0] is not None
+    # After execution, ACTIVE_CALL_ID should be restored
+    assert ACTIVE_CALL_ID.get() is None
+
+
+def test_tool_no_callbacks_fast_path():
+    """Tools work normally when no callbacks are configured."""
+    call_log = []
+
+    def my_tool(x: str) -> str:
+        call_log.append(x)
+        return "ok"
+
+    interp = MontyInterpreter(tools={"my_tool": my_tool})
+    # No dspy.context(callbacks=...) — fast path
+    result = interp.execute('my_tool(x="test")')
+    assert result == "ok"
+    assert call_log == ["test"]
