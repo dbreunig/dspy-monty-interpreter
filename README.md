@@ -12,7 +12,7 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `pydantic-monty>=0.0.10`.
+Requires `pydantic-monty>=0.0.12`.
 
 ## Usage
 
