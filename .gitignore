@@ -1,3 +1,6 @@
 tmp/
 .env
 .env.local
+dist
+tests/__pycache__/
+src/dspy_monty_interpreter/__pycache__/
