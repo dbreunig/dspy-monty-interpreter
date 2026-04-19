@@ -3,7 +3,7 @@
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
 
-from dspy_monty_interpreter import MontyInterpreter, MountDirectory
+from dspy_monty_interpreter import MontyInterpreter, MountDir
 
 
 # --- Protocol conformance ---
@@ -457,7 +457,7 @@ def test_mount_read_only():
     with tempfile.TemporaryDirectory() as tmpdir:
         Path(tmpdir, "data.txt").write_text("hello from mount")
         interp = MontyInterpreter(
-            mounts=MountDirectory("/data", tmpdir, mode="read-only")
+            mounts=MountDir("/data", tmpdir, mode="read-only")
         )
         result = interp.execute(
             "from pathlib import Path\nPath('/data/data.txt').read_text()"
@@ -472,7 +472,7 @@ def test_mount_overlay_write():
     with tempfile.TemporaryDirectory() as tmpdir:
         Path(tmpdir, "original.txt").write_text("original")
         interp = MontyInterpreter(
-            mounts=MountDirectory("/data", tmpdir, mode="overlay")
+            mounts=MountDir("/data", tmpdir, mode="overlay")
         )
         interp.execute(
             "from pathlib import Path\nPath('/data/new.txt').write_text('created')"
@@ -487,7 +487,7 @@ def test_mount_read_only_blocks_write():
     """Read-only mount rejects write operations."""
     import tempfile
     interp = MontyInterpreter(
-        mounts=MountDirectory("/data", tempfile.mkdtemp(), mode="read-only")
+        mounts=MountDir("/data", tempfile.mkdtemp(), mode="read-only")
     )
     with pytest.raises(CodeInterpreterError):
         interp.execute(
@@ -499,7 +499,7 @@ def test_mount_persists_across_executes():
     """Overlay state persists across execute() calls."""
     import tempfile
     interp = MontyInterpreter(
-        mounts=MountDirectory("/data", tempfile.mkdtemp(), mode="overlay")
+        mounts=MountDir("/data", tempfile.mkdtemp(), mode="overlay")
     )
     interp.execute(
         "from pathlib import Path\nPath('/data/state.txt').write_text('persisted')"

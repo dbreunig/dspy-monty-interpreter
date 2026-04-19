@@ -11,10 +11,11 @@ import dspy
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.utils.callback import ACTIVE_CALL_ID
 from pydantic_monty import (
+    AbstractOS,
     MontyRepl,
     MontyRuntimeError,
     MontySyntaxError,
-    MountDirectory,
+    MountDir,
     ResourceLimits,
 )
 
@@ -50,13 +51,15 @@ class MontyInterpreter:
         tools: dict[str, Callable[..., str]] | None = None,
         output_fields: list[dict] | None = None,
         resource_limits: ResourceLimits | None = None,
-        mounts: MountDirectory | list[MountDirectory] | None = None,
+        mounts: MountDir | list[MountDir] | None = None,
+        os_access: AbstractOS | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
         self.__tools_registered: bool = False
         self._resource_limits: ResourceLimits | None = resource_limits
-        self._mounts: MountDirectory | list[MountDirectory] | None = mounts
+        self._mounts: MountDir | list[MountDir] | None = mounts
+        self._os_access: AbstractOS | None = os_access
         self._repl: MontyRepl = self._new_repl()
         self._has_state: bool = False
         self._tool_instances: dict[str, dspy.Tool] = {}
@@ -174,6 +177,7 @@ class MontyInterpreter:
                 external_functions=external_fns,
                 print_callback=print_callback,
                 mount=self._mounts,
+                os=self._os_access,
             )
         except MontySyntaxError as e:
             raise SyntaxError(str(e)) from e

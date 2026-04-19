@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dspy-monty-interpreter"
-version = "0.2.2"
+version = "0.2.3"
 description = "DSPy CodeInterpreter implementation using Monty, a secure Python interpreter written in Rust"
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,12 +21,19 @@ classifiers = [
 ]
 dependencies = [
     "dspy>=3.0",
-    "pydantic-monty>=0.0.12",
+    "pydantic-monty>=0.0.15",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "python-dotenv>=1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests that call a live LLM API (requires API key in .env)",
 ]
 
 [tool.hatch.build.targets.wheel]
