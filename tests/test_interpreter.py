@@ -137,6 +137,21 @@ def test_tool_call():
     assert call_log == ["hello"]
 
 
+def test_tool_call_positional_args():
+    # LLM-emitted code commonly calls tools positionally — the wrapper
+    # must accept *args, not just **kwargs.
+    call_log = []
+
+    def merge(a: str, b: str) -> str:
+        call_log.append((a, b))
+        return f"{a}+{b}"
+
+    interp = MontyInterpreter(tools={"merge": merge})
+    assert interp.execute('merge("x", "y")') == "x+y"
+    assert interp.execute('merge("x", b="y")') == "x+y"
+    assert call_log == [("x", "y"), ("x", "y")]
+
+
 def test_tool_result_used_in_code():
     def lookup(key: str) -> str:
         return "found_value"

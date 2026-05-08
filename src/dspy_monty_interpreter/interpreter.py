@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import uuid
@@ -69,21 +70,30 @@ class MontyInterpreter:
 
     def _wrap_tool_with_callbacks(self, name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap a tool function to fire DSPy on_tool_start/on_tool_end callbacks."""
-        def wrapper(**kwargs: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             callbacks = dspy.settings.get("callbacks", [])
             if not callbacks:
-                return fn(**kwargs)
+                return fn(*args, **kwargs)
 
             # Lazily build and cache a Tool instance for this function
             if name not in self._tool_instances:
                 self._tool_instances[name] = dspy.Tool(fn, name=name)
             tool_instance = self._tool_instances[name]
 
+            # Best-effort: bind positional args to parameter names so the
+            # callback `inputs` dict is keyed by name. Fall back to kwargs
+            # alone if the signature can't be introspected or bound.
+            try:
+                bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+                inputs: dict[str, Any] = dict(bound.arguments)
+            except (TypeError, ValueError):
+                inputs = dict(kwargs)
+
             call_id = uuid.uuid4().hex
 
             for cb in callbacks:
                 try:
-                    cb.on_tool_start(call_id=call_id, instance=tool_instance, inputs=kwargs)
+                    cb.on_tool_start(call_id=call_id, instance=tool_instance, inputs=inputs)
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Callback error on tool start: {e}")
 
@@ -93,7 +103,7 @@ class MontyInterpreter:
             result = None
             exception = None
             try:
-                result = fn(**kwargs)
+                result = fn(*args, **kwargs)
                 return result
             except Exception as e:
                 exception = e
