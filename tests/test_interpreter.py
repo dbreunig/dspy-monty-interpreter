@@ -105,6 +105,25 @@ def test_submit_positional_with_output_fields():
     assert result.output == {"answer": "yes", "confidence": 0.9}
 
 
+def test_submit_single_positional_with_one_output_field():
+    # SUBMIT(value) with a single declared output field should map the
+    # value to that field, not return it bare. Otherwise RLM rejects
+    # with "FINAL returned <type>, expected dict with fields: [...]".
+    interp = MontyInterpreter(output_fields=[{"name": "quarterly_findings"}])
+    result = interp.execute("SUBMIT([1, 2, 3])")
+    assert isinstance(result, FinalOutput)
+    assert result.output == {"quarterly_findings": [1, 2, 3]}
+
+
+def test_submit_dict_matching_schema_passes_through():
+    # If the model already builds the schema dict and submits it,
+    # don't double-wrap.
+    interp = MontyInterpreter(output_fields=[{"name": "answer"}])
+    result = interp.execute('SUBMIT({"answer": "42"})')
+    assert isinstance(result, FinalOutput)
+    assert result.output == {"answer": "42"}
+
+
 def test_submit_no_args():
     interp = MontyInterpreter()
     result = interp.execute("SUBMIT()")

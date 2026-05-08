@@ -229,8 +229,17 @@ def _handle_submit(
     """Process SUBMIT() arguments into a FinalOutput."""
     if kwargs:
         return FinalOutput(dict(kwargs))
-    if len(args) > 1 and output_fields:
+    if args and output_fields:
         field_names = [f["name"] for f in output_fields]
+        # If a single dict positional arg already matches the output
+        # schema (e.g. SUBMIT({"answer": x})), pass it through verbatim
+        # instead of wrapping it again as {field_name: that_dict}.
+        if (
+            len(args) == 1
+            and isinstance(args[0], dict)
+            and set(args[0].keys()).issubset(field_names)
+        ):
+            return FinalOutput(dict(args[0]))
         return FinalOutput(dict(zip(field_names, args)))
     if len(args) == 1:
         return FinalOutput(args[0])
