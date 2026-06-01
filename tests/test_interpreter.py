@@ -711,3 +711,48 @@ def test_tool_callback_cache_updates_on_tool_change():
     assert len(instances) == 2
     assert instances[0].func is tool_v1
     assert instances[1].func is tool_v2
+
+
+# --- pydantic-monty 0.0.18 regressions ---
+
+
+def test_comprehension_store_in_repl():
+    """REPL store of names bound inside comprehension expressions (monty #297).
+    Previously, building a comprehension that referenced persisted state and
+    assigning the result could fail under MontyRepl."""
+    interp = MontyInterpreter()
+    interp.execute("nums = [1, 2, 3, 4]")
+    assert interp.execute("squares = [n * n for n in nums]\nprint(sum(squares))") == "30"
+    # The comprehension result persists and is reusable on the next call.
+    assert interp.execute("len(squares)") == "4"
+    # Dict comprehension referencing prior state behaves the same.
+    assert interp.execute("m = {n: n * n for n in nums}\nprint(m[3])") == "9"
+
+
+def test_context_manager_with_open():
+    """`with` / context-manager support plus the sandboxed open() builtin
+    (monty #462, #456, #461), exercised over an overlay mount."""
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        Path(tmpdir, "in.txt").write_text("line one\nline two\n")
+        interp = MontyInterpreter(mounts=MountDir("/data", tmpdir, mode="overlay"))
+        assert interp.execute(
+            "with open('/data/in.txt') as f:\n    data = f.read()\nprint(len(data))"
+        ) == "18"
+        interp.execute("with open('/data/out.txt', 'w') as f:\n    f.write('hello cm')")
+        assert interp.execute(
+            "with open('/data/out.txt') as f:\n    print(f.read())"
+        ) == "hello cm"
+
+
+def test_external_function_identity():
+    """Name-based identity and equality for external function values
+    (monty #458) — covers both injected tools and SUBMIT."""
+    def my_tool(x: str) -> str:
+        return "v"
+
+    interp = MontyInterpreter(tools={"my_tool": my_tool})
+    assert interp.execute("f = my_tool\nprint(f is my_tool)") == "True"
+    assert interp.execute("f = my_tool\nprint(f == my_tool)") == "True"
+    assert interp.execute("print(SUBMIT is SUBMIT)") == "True"
