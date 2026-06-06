@@ -6,9 +6,14 @@ API key. Run them explicitly: ``pytest examples/test_repo_rlm.py``.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
+
+# Make the example importable regardless of the working directory pytest is
+# invoked from (examples/ is not a package and not on sys.path by default).
+sys.path.insert(0, str(Path(__file__).parent))
 
 from repo_rlm import RepoRLM
 

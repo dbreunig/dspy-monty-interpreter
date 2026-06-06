@@ -19,7 +19,10 @@ Repos may be local checkouts or remote specs (a clone URL or ``owner/repo``),
 which are shallow-cloned to a temp directory at construction. Clones persist on
 disk unless ``cleanup=True`` is passed.
 
-Run it::
+Run it from the ``examples/`` directory (so ``repo_rlm`` is importable), or add
+that directory to ``sys.path`` first::
+
+    import sys; sys.path.insert(0, "examples")  # if running from the repo root
 
     import dspy
     from repo_rlm import RepoRLM
