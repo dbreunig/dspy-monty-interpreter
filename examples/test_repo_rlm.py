@@ -1,7 +1,7 @@
-"""Tests for RepoRLM (construction, manifest, mounts, injection).
+"""Tests for the RepoRLM example (construction, manifest, mounts, injection).
 
 These exercise everything except the live-LLM forward() loop, which needs an
-API key and is covered by the e2e suite.
+API key. Run them explicitly: ``pytest examples/test_repo_rlm.py``.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from dspy_monty_interpreter import MontyInterpreter, RepoRLM
+from repo_rlm import RepoRLM
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def test_single_local_repo_mounts_read_only(sample_repo: Path):
     analyzer = RepoRLM(str(sample_repo))
     interp = analyzer._interpreter
 
-    mounts = interp.mounts
+    mounts = interp._mounts
     assert isinstance(mounts, list) and len(mounts) == 1
     # Default signature exposes a `report` output field.
     assert "report" in analyzer.signature.output_fields
@@ -136,10 +136,3 @@ def test_custom_signature(sample_repo: Path):
         "task -> public_api: list[str], summary: str",
     )
     assert set(analyzer.signature.output_fields) == {"public_api", "summary"}
-
-
-def test_provided_interpreter_is_used(sample_repo: Path):
-    interp = MontyInterpreter()
-    analyzer = RepoRLM(str(sample_repo), interpreter=interp)
-    assert analyzer._interpreter is interp
-    assert interp.mounts is not None

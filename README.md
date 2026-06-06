@@ -48,51 +48,28 @@ interp = MontyInterpreter(tools={"lookup": lookup})
 interp.execute('result = lookup(key="foo")\nprint(result)')
 ```
 
-### Analyzing repositories with `RepoRLM`
+### Filesystem access
 
-`RepoRLM` is a `dspy.RLM` specialized for exploring one or more repositories.
-It mounts each repo into the Monty sandbox (read-only by default) and tells the
-model what's available — both as a manifest spliced into the prompt and as a
-structured `repos` REPL variable — so the LLM can read files with `pathlib` and
-build up an answer iteratively.
+Monty's sandbox can read and write files when you opt in. Mount a host
+directory with `MountDir`, or supply an in-memory filesystem via `os_access`:
 
 ```python
-import dspy
-from dspy_monty_interpreter import RepoRLM
+from dspy_monty_interpreter import MontyInterpreter, MountDir
 
-dspy.configure(lm=dspy.LM("anthropic/claude-opus-4-8"))
-
-# Local checkout
-analyzer = RepoRLM("/home/user/checkouts/requests")
-print(analyzer(task="Map the public API, module layout, and key abstractions.").report)
+# read-only host dir; "overlay" keeps writes in memory, leaving the host alone
+interp = MontyInterpreter(mounts=MountDir("/data", "/path/on/host", mode="read-only"))
+interp.execute("from pathlib import Path\nprint(Path('/data/notes.txt').read_text())")
 ```
 
-```python
-# Clone from GitHub on the fly ("owner/repo" or a clone URL).
-# Clones persist on disk unless cleanup=True is passed.
-analyzer = RepoRLM("psf/requests", cleanup=True)
-print(analyzer(task="Summarize the architecture.").report)
-```
+## Examples
 
-```python
-# Compare multiple repos (names taken from the dict keys)
-analyzer = RepoRLM({"requests": "/repos/requests", "httpx": "/repos/httpx"})
-analyzer(task="Compare the public client API and dependency footprint.")
-```
+See [`examples/`](examples/) for patterns built on top of the library:
 
-```python
-# Structured output instead of a prose report
-analyzer = RepoRLM(
-    "/repos/requests",
-    "task -> public_api: list[str], dependencies: list[str], summary: str",
-)
-r = analyzer(task="Audit for maintenance risk.")
-print(r.public_api, r.dependencies, r.summary)
-```
-
-Repos mount under `/repos/<name>`. Pass `mode="overlay"` to let the model write
-scratch files (captured in memory; the host is never modified). The default
-signature is `task -> report: str`.
+- [`examples/repo_rlm.py`](examples/repo_rlm.py) — `RepoRLM`, a `dspy.RLM`
+  specialized for analyzing one or more repositories. It mounts repos (local
+  checkouts or cloned from `owner/repo`) into Monty and surfaces them to the LLM
+  via a prompt manifest plus a `repos` REPL variable, so the model can read the
+  code and produce a report.
 
 ## Why Monty?
 

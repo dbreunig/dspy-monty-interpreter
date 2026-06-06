@@ -1,19 +1,32 @@
-"""RepoRLM: a Recursive Language Model specialized for analyzing repositories.
+"""Example: a Recursive Language Model specialized for analyzing repositories.
 
-``RepoRLM`` subclasses :class:`dspy.RLM` and wires one or more repositories into
-a Monty sandbox so an LLM can explore them by writing code. Repos are mounted
-read-only by default under ``/repos/<name>``; the model is told what's available
-through two channels:
+This is an EXAMPLE built on top of the library, not part of the package's
+public API. It demonstrates how to surface a Monty filesystem overlay to an
+LLM driving ``dspy.RLM``.
 
-1. A manifest spliced into the action instructions (the prompt's "Available:"
-   block), describing each repo's mount path, mode, file count, and a shallow
-   top-level tree.
-2. A ``repos`` REPL variable holding the same information as structured data, so
-   the model can enumerate paths programmatically.
+The core library already enables filesystem access: ``MontyInterpreter`` accepts
+``mounts`` / ``os_access`` and forwards them to Monty. The interesting part this
+example shows is how to make the *model* aware of the mounted files, since
+``dspy.RLM`` treats the interpreter as opaque to its prompt. We do that with two
+seams that use only public DSPy API:
+
+1. A manifest spliced into the action instructions via
+   ``Signature.with_instructions()`` (the prompt's "Available:" block).
+2. A structured ``repos`` REPL variable injected in ``forward()`` / ``aforward()``
+   so the model can enumerate paths programmatically.
 
 Repos may be local checkouts or remote specs (a clone URL or ``owner/repo``),
 which are shallow-cloned to a temp directory at construction. Clones persist on
 disk unless ``cleanup=True`` is passed.
+
+Run it::
+
+    import dspy
+    from repo_rlm import RepoRLM
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-opus-4-8"))
+    analyzer = RepoRLM("psf/requests", cleanup=True)
+    print(analyzer(task="Map the public API and module layout.").report)
 """
 
 from __future__ import annotations
@@ -29,8 +42,7 @@ from typing import Any, Iterable, Literal
 
 import dspy
 
-from dspy_monty_interpreter.interpreter import MontyInterpreter
-from pydantic_monty import MountDir
+from dspy_monty_interpreter import MontyInterpreter, MountDir
 
 # Directory/file names skipped when counting files and building the tree, so the
 # model isn't drowned in vendored deps and build artifacts.
@@ -92,7 +104,7 @@ _MANIFEST_HEADER = "Repositories mounted under {root} ({mode}, read with pathlib
 
 
 class RepoRLM(dspy.RLM):
-    """RLM specialized for analyzing one or more repositories with Monty.
+    """Example RLM specialized for analyzing one or more repositories with Monty.
 
     Args:
         repos: What to analyze. A path or remote spec, a list of them, or a
@@ -108,7 +120,7 @@ class RepoRLM(dspy.RLM):
             :data:`DEFAULT_EXCLUDES`.
         cleanup: If True, delete any cloned temp directories when this instance
             is closed/garbage-collected. Local checkouts are never deleted.
-        interpreter: A :class:`MontyInterpreter` to use. One is created if None.
+        resource_limits / tools / sub_lm: forwarded to the interpreter / RLM.
         Remaining keyword arguments are forwarded to :class:`dspy.RLM`.
 
     Example::
@@ -126,7 +138,7 @@ class RepoRLM(dspy.RLM):
         mount_root: str = "/repos",
         exclude: Iterable[str] | None = None,
         cleanup: bool = False,
-        interpreter: MontyInterpreter | None = None,
+        resource_limits: Any = None,
         max_iterations: int = 30,
         max_llm_calls: int = 60,
         max_output_chars: int = 10_000,
@@ -145,12 +157,17 @@ class RepoRLM(dspy.RLM):
         # keyed by a unique mount name.
         self.repo_paths: dict[str, str] = self._resolve_repos(repos)
 
-        interp = interpreter if interpreter is not None else MontyInterpreter()
+        # The core library already supports filesystem overlay via the
+        # constructor: we build the interpreter with the mounts here.
         mounts = [
             MountDir(self._mount_path(name), path, mode=mode)
             for name, path in self.repo_paths.items()
         ]
-        interp.mounts = mounts
+        interp = MontyInterpreter(
+            tools={t.__name__: t for t in tools} if tools else None,
+            resource_limits=resource_limits,
+            mounts=mounts,
+        )
 
         # Structured index injected as the `repos` REPL variable, plus the prose
         # manifest spliced into the action instructions.
