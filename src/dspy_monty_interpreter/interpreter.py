@@ -122,6 +122,26 @@ class MontyInterpreter:
     def tools(self) -> dict[str, Callable[..., str]]:
         return self._tools
 
+    @property
+    def mounts(self) -> MountDir | list[MountDir] | None:
+        return self._mounts
+
+    @mounts.setter
+    def mounts(self, value: MountDir | list[MountDir] | None) -> None:
+        # Public seam so modules like RepoRLM can attach filesystem mounts to an
+        # interpreter they own, rather than requiring callers to wire mounts
+        # through the constructor. Mounts are applied per feed_run(), so this
+        # takes effect on the next execute() without rebuilding the REPL.
+        self._mounts = value
+
+    @property
+    def os_access(self) -> AbstractOS | None:
+        return self._os_access
+
+    @os_access.setter
+    def os_access(self, value: AbstractOS | None) -> None:
+        self._os_access = value
+
     # RLM sets ``_tools_registered = False`` via _inject_execution_context at
     # the start of every forward() call.  We intercept that write so we can
     # automatically clear REPL state between RLM runs.
