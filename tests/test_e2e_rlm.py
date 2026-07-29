@@ -66,7 +66,7 @@ def test_rlm_computes_via_monty():
 
 
 def test_rlm_with_custom_tool():
-    """RLM can invoke a user-provided tool through Monty's external_functions."""
+    """RLM can invoke a user-provided tool through Monty's external_lookup."""
     dspy.configure(lm=_select_lm())
 
     call_log: list[str] = []
@@ -95,3 +95,27 @@ def test_rlm_with_custom_tool():
     assert any(c.lower() == "paris" for c in call_log), (
         f"tool should have been called for Paris, got calls={call_log}"
     )
+
+
+def test_rlm_parallel_forwards_share_one_interpreter():
+    """One MontyInterpreter instance serving concurrent RLM forwards
+    (the dspy.Evaluate / dspy.Parallel pattern) returns correct,
+    non-interfering results."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    dspy.configure(lm=_select_lm())
+
+    interpreter = MontyInterpreter()
+    rlm = dspy.RLM(
+        "numbers: list[int] -> total: int",
+        interpreter=interpreter,
+        max_iterations=5,
+        max_llm_calls=3,
+    )
+
+    inputs = [[1, 2, 3], [10, 20], [100, 200, 300]]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        results = list(ex.map(lambda nums: rlm(numbers=nums), inputs))
+
+    assert [int(r.total) for r in results] == [6, 30, 600]
+    interpreter.shutdown()

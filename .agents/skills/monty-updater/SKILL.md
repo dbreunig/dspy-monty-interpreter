@@ -15,12 +15,14 @@ Single class: `MontyInterpreter` in `src/dspy_monty_interpreter/interpreter.py`.
 
 Key Monty surface area it consumes (from `pydantic_monty`):
 
-- `MontyRepl` — persistent incremental REPL. Created in `_new_repl()`, replaced on `shutdown()` and whenever RLM resets `_tools_registered = False`.
-- `MontyRepl.feed_run(code, inputs=, external_functions=, print_callback=, mount=, os=)` — the one execution call. Any signature change here is a breaking change. (`skip_type_check=` also exists but adapter does not use it.)
+- `Monty` — subprocess worker pool, created lazily in `_ensure_session()` (entered manually, not via `with`), closed on `shutdown()`. `request_timeout` is passed through from the adapter constructor.
+- `MontySession` — persistent incremental REPL session from `pool.checkout(limits=…)`. Discarded (returned to pool) on `shutdown()`, on `MontyCrashedError`, and whenever RLM resets `_tools_registered = False`.
+- `MontySession.feed_run(code, inputs=, external_lookup=, print_callback=, mount=, os=)` — the one execution call. Any signature change here is a breaking change. (`skip_type_check=` also exists but adapter does not use it. `external_lookup` was named `external_functions` before 0.0.19.)
 - `MontyRuntimeError`, `MontySyntaxError` — caught and re-raised as DSPy `CodeInterpreterError` / Python `SyntaxError`.
-- `MountDir` — passed through as `mounts` constructor arg. (Renamed from `MountDirectory` in 0.0.13.)
+- `MontyCrashedError` — worker died or hit `request_timeout`; adapter discards the session (state is lost) and re-raises as `CodeInterpreterError`.
+- `MountDir` — passed through as `mounts` constructor arg. Keyword-only since 0.0.19 (`host_path=`, `virtual_path=`, `mode=`). Overlay writes are per-feed since 0.0.19 — discarded when each `feed_run` ends.
 - `AbstractOS` — passed through as `os_access` constructor arg, forwarded to `feed_run(os=…)`. `OSAccess` is the concrete subclass users most often instantiate.
-- `ResourceLimits` — passed through as `resource_limits` constructor arg, forwarded to `MontyRepl(limits=…)`.
+- `ResourceLimits` — passed through as `resource_limits` constructor arg, forwarded to `checkout(limits=…)`. A TypedDict since 0.0.19.
 
 Adapter responsibilities Monty does NOT provide:
 
@@ -32,9 +34,9 @@ Adapter responsibilities Monty does NOT provide:
 Project goals (informs the recommendation):
 
 - Stay a **thin** adapter — push capability into Monty, keep wrapping minimal.
-- Track real Monty capability: as Monty grows (classes, more stdlib, match stmts) update README's "limitations" list.
+- Track real Monty capability: as Monty grows (more stdlib, match stmts) update README's "limitations" list. (Classes work as of 0.0.19.)
 - Maintain compatibility with `dspy>=3.0`'s `CodeInterpreter` protocol.
-- Currently pinned: `pydantic-monty>=0.0.15` in `pyproject.toml`.
+- Currently pinned: `pydantic-monty>=0.0.19` in `pyproject.toml`.
 
 ## Workflow
 

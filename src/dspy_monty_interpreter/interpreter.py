@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+import threading
 import uuid
 from typing import Any, Callable, Literal
 
@@ -13,8 +14,10 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.utils.callback import ACTIVE_CALL_ID
 from pydantic_monty import (
     AbstractOS,
-    MontyRepl,
+    Monty,
+    MontyCrashedError,
     MontyRuntimeError,
+    MontySession,
     MontySyntaxError,
     MountDir,
     ResourceLimits,
@@ -31,14 +34,23 @@ class MontyInterpreter:
     """DSPy CodeInterpreter implementation backed by Monty.
 
     Monty is a secure Python interpreter written in Rust. Unlike the default
-    PythonInterpreter (Deno/Pyodide), Monty starts in microseconds, has no
-    subprocess overhead, and provides strict sandboxing with no network or
-    environment access. Filesystem access can be enabled per-interpreter via
-    the ``mounts`` parameter.
+    PythonInterpreter (Deno/Pyodide), Monty has no WASM bootstrap and provides
+    strict sandboxing with no network or environment access. As of Monty
+    0.0.19, code runs in a pool of ``monty`` worker subprocesses: a crashed
+    or timed-out worker is replaced transparently without taking down the
+    host process. Filesystem access can be enabled per-interpreter via the
+    ``mounts`` parameter.
 
-    State persists across ``execute()`` calls via ``MontyRepl``, Monty's
-    built-in incremental REPL — each snippet is compiled and run against
+    State persists across ``execute()`` calls via ``MontySession``, Monty's
+    incremental REPL session — each snippet is compiled and run against
     the persistent heap and namespace without replaying prior snippets.
+
+    Sessions are per-thread: concurrent ``execute()`` calls from different
+    threads (e.g. ``dspy.Evaluate`` / ``dspy.Parallel`` running the same RLM
+    with ``num_threads``) each get their own isolated session, all sharing
+    one worker pool. RLM's per-forward reset discards only the calling
+    thread's session. For thread counts above your CPU count, pass
+    ``max_processes`` so the pool has one worker per thread.
 
     Usage with RLM::
 
@@ -54,6 +66,8 @@ class MontyInterpreter:
         resource_limits: ResourceLimits | None = None,
         mounts: MountDir | list[MountDir] | None = None,
         os_access: AbstractOS | None = None,
+        request_timeout: float | None = None,
+        max_processes: int | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
@@ -61,12 +75,65 @@ class MontyInterpreter:
         self._resource_limits: ResourceLimits | None = resource_limits
         self._mounts: MountDir | list[MountDir] | None = mounts
         self._os_access: AbstractOS | None = os_access
-        self._repl: MontyRepl = self._new_repl()
-        self._has_state: bool = False
+        self._request_timeout: float | None = request_timeout
+        self._max_processes: int | None = max_processes
+        self._pool: Monty | None = None
+        self._lock = threading.Lock()
+        self._generation: int = 0
+        self._thread_local = threading.local()
+        # Sessions from every thread, so shutdown() can reclaim them all.
+        self._live_sessions: dict[int, MontySession] = {}
         self._tool_instances: dict[str, dspy.Tool] = {}
 
-    def _new_repl(self) -> MontyRepl:
-        return MontyRepl(limits=self._resource_limits)
+    # Session state is per-thread; _has_state gates whether an RLM reset
+    # needs to discard the calling thread's session.
+    @property
+    def _has_state(self) -> bool:
+        return getattr(self._thread_local, "has_state", False)
+
+    @_has_state.setter
+    def _has_state(self, value: bool) -> None:
+        self._thread_local.has_state = value
+
+    def _ensure_session(self) -> MontySession:
+        """Return the calling thread's live REPL session, lazily spawning
+        the shared worker pool and checking out a session on first use."""
+        local = self._thread_local
+        if getattr(local, "generation", None) != self._generation:
+            # shutdown() ran since this thread last executed; its old
+            # session was already reclaimed there.
+            local.session = None
+            local.has_state = False
+            local.generation = self._generation
+        if getattr(local, "session", None) is None:
+            with self._lock:
+                if self._pool is None:
+                    self._pool = Monty(
+                        request_timeout=self._request_timeout,
+                        max_processes=self._max_processes,
+                    )
+                    self._pool.__enter__()
+                pool = self._pool
+            session = pool.checkout(limits=self._resource_limits)
+            session.__enter__()
+            local.session = session
+            with self._lock:
+                self._live_sessions[id(session)] = session
+        return local.session
+
+    def _discard_session(self) -> None:
+        """Return the calling thread's worker to the pool; the thread's
+        next execute() checks out a fresh session with empty state."""
+        session = getattr(self._thread_local, "session", None)
+        if session is not None:
+            with self._lock:
+                self._live_sessions.pop(id(session), None)
+            try:
+                session.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._thread_local.session = None
+        self._thread_local.has_state = False
 
     def _wrap_tool_with_callbacks(self, name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap a tool function to fire DSPy on_tool_start/on_tool_end callbacks."""
@@ -132,8 +199,7 @@ class MontyInterpreter:
     @_tools_registered.setter
     def _tools_registered(self, value: bool) -> None:
         if not value and self._has_state:
-            self._repl = self._new_repl()
-            self._has_state = False
+            self._discard_session()
         if not value:
             self._tool_instances.clear()
         self.__tools_registered = value
@@ -149,7 +215,7 @@ class MontyInterpreter:
         """Execute Python code and return the result.
 
         State from prior successful execute() calls is preserved via
-        ``MontyRepl``'s persistent heap and namespace.
+        ``MontySession``'s persistent heap and namespace.
 
         Returns:
             FinalOutput if SUBMIT() was called, str for print output,
@@ -164,7 +230,7 @@ class MontyInterpreter:
 
         print_output: list[str] = []
 
-        def print_callback(_stream: Literal["stdout"], text: str) -> None:
+        def print_callback(_stream: Literal["stdout", "stderr"], text: str) -> None:
             print_output.append(text)
 
         # SUBMIT captures its args into a box and returns None so the VM
@@ -180,17 +246,27 @@ class MontyInterpreter:
         }
         external_fns["SUBMIT"] = submit_fn
 
+        session = self._ensure_session()
         try:
-            result = self._repl.feed_run(
+            result = session.feed_run(
                 code,
                 inputs=variables if variables else None,
-                external_functions=external_fns,
+                external_lookup=external_fns,
                 print_callback=print_callback,
                 mount=self._mounts,
                 os=self._os_access,
             )
         except MontySyntaxError as e:
             raise SyntaxError(str(e)) from e
+        except MontyCrashedError as e:
+            # The worker died (crash or request_timeout); the session and
+            # its state are lost. Discard it so the next execute() checks
+            # out a fresh session, but still honor a captured SUBMIT.
+            self._discard_session()
+            if submit_box:
+                args, kwargs = submit_box[0]
+                return _handle_submit(args, kwargs, self.output_fields)
+            raise CodeInterpreterError(str(e)) from e
         except MontyRuntimeError as e:
             # If SUBMIT was called before the error, honor it.
             if submit_box:
@@ -208,8 +284,22 @@ class MontyInterpreter:
         return _build_output(result, print_output)
 
     def shutdown(self) -> None:
-        self._repl = self._new_repl()
-        self._has_state = False
+        with self._lock:
+            sessions = list(self._live_sessions.values())
+            self._live_sessions.clear()
+            pool, self._pool = self._pool, None
+            # Invalidate every thread's cached session reference.
+            self._generation += 1
+        for session in sessions:
+            try:
+                session.__exit__(None, None, None)
+            except Exception:
+                pass
+        if pool is not None:
+            try:
+                pool.__exit__(None, None, None)
+            except Exception:
+                pass
         self._tool_instances.clear()
         self.__tools_registered = False
 
