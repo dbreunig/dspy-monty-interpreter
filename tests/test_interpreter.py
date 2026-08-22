@@ -1261,3 +1261,15 @@ def test_rlm_prompt_includes_mount_description(tmp_path):
     rlm = dspy.RLM("q -> a", interpreter_factory=factory)
     instructions = rlm.generate_action.signature.instructions
     assert "/data (read-only)" in instructions and "a.csv" in instructions
+
+
+def test_instructions_separate_filesystem_section_with_newline(tmp_path):
+    no_mounts = MontyInterpreter.factory().execution_instructions
+    assert "calling it.\nThe filesystem is unavailable" in no_mounts
+    assert no_mounts == no_mounts.strip()
+
+    with_mounts = MontyInterpreter.factory(
+        mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")
+    ).execution_instructions
+    assert "calling it.\nMounted directories" in with_mounts
+    assert with_mounts == with_mounts.strip()

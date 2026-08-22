@@ -61,7 +61,7 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "step before calling it."
     )
 
-_NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted. "
+_NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted."
 
 _MOUNT_MODE_DESCRIPTIONS = {
     "read-only": "read-only",
@@ -91,7 +91,7 @@ def _describe_mounts(mounts: MountDir | list[MountDir] | None, listing_limit: in
         if listing_limit > 0:
             line += f" containing {_list_host_dir(m.host_path, listing_limit)}"
         lines.append(line)
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
 
 
 def _short_name(entry: os.DirEntry) -> str:
@@ -168,7 +168,7 @@ def _summarize_entries(entries: list[os.DirEntry], truncated: bool) -> str:
 def _build_execution_instructions(
     mounts: MountDir | list[MountDir] | None, listing_limit: int = _MOUNT_LISTING_LIMIT
 ) -> str:
-    return _BASE_EXECUTION_INSTRUCTIONS + _describe_mounts(mounts, listing_limit)
+    return _BASE_EXECUTION_INSTRUCTIONS + "\n" + _describe_mounts(mounts, listing_limit)
 
 
 class _MontyFactory:
