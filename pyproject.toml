@@ -20,14 +20,15 @@ classifiers = [
     "Topic :: Software Development :: Interpreters",
 ]
 dependencies = [
-    "dspy>=3.0",
-    "pydantic-monty>=0.0.19",
+    "dspy>=3.3.1",
+    "pydantic-monty>=0.0.20",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "python-dotenv>=1.0",
+    "cmpnd>=0.11.0",
 ]
 
 [tool.pytest.ini_options]

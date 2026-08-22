@@ -1,10 +1,13 @@
 """Tests for MontyInterpreter."""
 
 import pytest
-from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
+from dspy.primitives.code_interpreter import (
+    CodeInterpreter,
+    CodeInterpreterError,
+    FinalOutput,
+)
 
 from dspy_monty_interpreter import MontyInterpreter, MountDir
-
 
 # --- Protocol conformance ---
 
@@ -583,103 +586,173 @@ def test_partial_mutation_persists_on_error():
     assert result == "99"  # not reverted to 1
 
 
-# --- Tool callbacks ---
+# --- DSPy interpreter lifecycle callbacks (dspy >= 3.3.1) ---
 
 
-def test_tool_callback_fires():
-    """Tool invocation fires on_tool_start and on_tool_end callbacks."""
-    import dspy
+def _lifecycle_recorder():
+    """A BaseCallback that records every on_interpreter_* event."""
     from dspy.utils.callback import BaseCallback
 
     events = []
 
     class Recorder(BaseCallback):
+        def on_interpreter_execute_start(self, call_id, instance, inputs):
+            events.append(("execute_start", call_id, instance, inputs))
+
+        def on_interpreter_execute_end(self, call_id, outputs, exception=None):
+            events.append(("execute_end", call_id, outputs, exception))
+
+        def on_interpreter_tool_call_start(self, call_id, instance, inputs):
+            events.append(("tool_call_start", call_id, instance, inputs))
+
+        def on_interpreter_tool_call_end(self, call_id, outputs, exception=None):
+            events.append(("tool_call_end", call_id, outputs, exception))
+
+        def on_interpreter_startup_start(self, call_id, instance, inputs):
+            events.append(("startup_start", call_id, instance, inputs))
+
+        def on_interpreter_startup_end(self, call_id, outputs, exception=None):
+            events.append(("startup_end", call_id, outputs, exception))
+
+        def on_interpreter_shutdown_start(self, call_id, instance, inputs):
+            events.append(("shutdown_start", call_id, instance, inputs))
+
+        def on_interpreter_shutdown_end(self, call_id, outputs, exception=None):
+            events.append(("shutdown_end", call_id, outputs, exception))
+
+        # Tool-level events are the job of dspy.Tool (RLM wraps user tools
+        # in one). The interpreter must not fire them itself.
         def on_tool_start(self, call_id, instance, inputs):
-            events.append(("start", call_id, instance.name, inputs))
+            events.append(("tool_start", call_id, instance, inputs))
 
         def on_tool_end(self, call_id, outputs, exception=None):
-            events.append(("end", call_id, outputs, exception))
+            events.append(("tool_end", call_id, outputs, exception))
+
+    return Recorder(), events
+
+
+def test_execute_fires_interpreter_execute_callbacks():
+    import dspy
+
+    recorder, events = _lifecycle_recorder()
+    interp = MontyInterpreter()
+    with dspy.context(callbacks=[recorder]):
+        result = interp.execute("print(1 + 1)")
+
+    assert result == "2"
+    kinds = [e[0] for e in events]
+    assert kinds == ["execute_start", "execute_end"]
+    _, start_id, instance, inputs = events[0]
+    assert instance is interp
+    assert inputs["code"] == "print(1 + 1)"
+    _, end_id, outputs, exc = events[1]
+    assert end_id == start_id
+    assert outputs == "2"
+    assert exc is None
+
+
+def test_execute_end_callback_receives_exception():
+    import dspy
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    recorder, events = _lifecycle_recorder()
+    interp = MontyInterpreter()
+    with dspy.context(callbacks=[recorder]), pytest.raises(CodeExecutionError):
+        interp.execute("1/0")
+
+    assert events[-1][0] == "execute_end"
+    assert isinstance(events[-1][3], CodeExecutionError)
+
+
+def test_tool_call_fires_interpreter_tool_call_callbacks_once():
+    """A sandbox->host tool call fires on_interpreter_tool_call_* exactly
+    once, nested under the execute call, and fires NO on_tool_* events."""
+    import dspy
+
+    recorder, events = _lifecycle_recorder()
 
     def search(query: str) -> str:
         return f"result for {query}"
 
     interp = MontyInterpreter(tools={"search": search})
-
-    with dspy.context(callbacks=[Recorder()]):
+    with dspy.context(callbacks=[recorder]):
         result = interp.execute('search(query="python")')
 
     assert result == "result for python"
-    assert len(events) == 2
+    kinds = [e[0] for e in events]
+    assert kinds == ["execute_start", "tool_call_start", "tool_call_end", "execute_end"]
+    assert "tool_start" not in kinds
 
-    kind, start_id, name, inputs = events[0]
-    assert kind == "start"
-    assert name == "search"
-    assert inputs == {"query": "python"}
-
-    kind, end_id, outputs, exc = events[1]
-    assert kind == "end"
-    assert end_id == start_id
+    _, tc_id, instance, inputs = events[1]
+    assert instance is interp
+    assert inputs == {"tool_name": "search", "kwargs": {"query": "python"}}
+    _, tc_end_id, outputs, exc = events[2]
+    assert tc_end_id == tc_id
     assert outputs == "result for python"
     assert exc is None
 
 
-def test_tool_callback_fires_on_error():
-    """on_tool_end fires with exception when tool raises."""
+def test_tool_call_end_callback_receives_exception():
     import dspy
-    from dspy.utils.callback import BaseCallback
+    from dspy.primitives.code_interpreter import CodeExecutionError
 
-    events = []
-
-    class Recorder(BaseCallback):
-        def on_tool_start(self, call_id, instance, inputs):
-            events.append(("start", call_id))
-
-        def on_tool_end(self, call_id, outputs, exception=None):
-            events.append(("end", call_id, outputs, exception))
+    recorder, events = _lifecycle_recorder()
 
     def bad_tool() -> str:
         raise ValueError("boom")
 
     interp = MontyInterpreter(tools={"bad_tool": bad_tool})
+    with dspy.context(callbacks=[recorder]), pytest.raises(CodeExecutionError):
+        interp.execute("bad_tool()")
 
-    with dspy.context(callbacks=[Recorder()]):
-        with pytest.raises(CodeInterpreterError):
-            interp.execute("bad_tool()")
-
-    assert len(events) == 2
-    assert events[0][0] == "start"
-    assert events[1][0] == "end"
-    assert events[1][2] is None  # outputs
-    assert isinstance(events[1][3], ValueError)  # exception
+    tc_end = [e for e in events if e[0] == "tool_call_end"]
+    assert len(tc_end) == 1
+    assert tc_end[0][2] is None
+    assert isinstance(tc_end[0][3], ValueError)
 
 
-def test_tool_callback_sets_active_call_id():
-    """ACTIVE_CALL_ID is set during tool execution."""
+def test_tool_call_active_call_id_nests_under_execute():
+    """Inside a tool, ACTIVE_CALL_ID is the tool-call id, whose parent is
+    the execute call id; it is restored afterwards."""
     import dspy
-    from dspy.utils.callback import ACTIVE_CALL_ID, BaseCallback
+    from dspy.utils.callback import ACTIVE_CALL_ID
 
-    captured_ids = []
-
-    class Recorder(BaseCallback):
-        def on_tool_start(self, call_id, instance, inputs):
-            pass
-
-        def on_tool_end(self, call_id, outputs, exception=None):
-            pass
+    recorder, events = _lifecycle_recorder()
+    captured = []
 
     def spy_tool() -> str:
-        captured_ids.append(ACTIVE_CALL_ID.get())
+        captured.append(ACTIVE_CALL_ID.get())
         return "ok"
 
     interp = MontyInterpreter(tools={"spy_tool": spy_tool})
-
-    with dspy.context(callbacks=[Recorder()]):
+    with dspy.context(callbacks=[recorder]):
         interp.execute("spy_tool()")
 
-    assert len(captured_ids) == 1
-    assert captured_ids[0] is not None
-    # After execution, ACTIVE_CALL_ID should be restored
+    tool_call_id = next(e for e in events if e[0] == "tool_call_start")[1]
+    assert captured == [tool_call_id]
     assert ACTIVE_CALL_ID.get() is None
+
+
+def test_start_and_shutdown_fire_lifecycle_callbacks():
+    import dspy
+
+    recorder, events = _lifecycle_recorder()
+    interp = MontyInterpreter()
+    with dspy.context(callbacks=[recorder]):
+        interp.start()
+        interp.shutdown()
+
+    kinds = [e[0] for e in events]
+    assert kinds == ["startup_start", "startup_end", "shutdown_start", "shutdown_end"]
+    assert events[0][2] is interp
+
+
+def test_instance_level_callbacks_are_honored():
+    """Callbacks passed to the constructor fire without dspy.context()."""
+    recorder, events = _lifecycle_recorder()
+    interp = MontyInterpreter(callbacks=[recorder])
+    assert interp.execute("print('hi')") == "hi"
+    assert [e[0] for e in events] == ["execute_start", "execute_end"]
 
 
 def test_tool_no_callbacks_fast_path():
@@ -691,25 +764,13 @@ def test_tool_no_callbacks_fast_path():
         return "ok"
 
     interp = MontyInterpreter(tools={"my_tool": my_tool})
-    # No dspy.context(callbacks=...) — fast path
     result = interp.execute('my_tool(x="test")')
     assert result == "ok"
     assert call_log == ["test"]
 
 
-def test_tool_callback_cache_updates_on_tool_change():
-    """Cached Tool instances update when the underlying function changes."""
-    import dspy
-    from dspy.utils.callback import BaseCallback
-
-    instances = []
-
-    class Recorder(BaseCallback):
-        def on_tool_start(self, call_id, instance, inputs):
-            instances.append(instance)
-
-        def on_tool_end(self, call_id, outputs, exception=None):
-            pass
+def test_tools_can_be_swapped_between_executes():
+    """RLM replaces interpreter.tools entries between forward() calls."""
 
     def tool_v1(x: str) -> str:
         return "v1"
@@ -718,18 +779,100 @@ def test_tool_callback_cache_updates_on_tool_change():
         return "v2"
 
     interp = MontyInterpreter(tools={"my_tool": tool_v1})
+    assert interp.execute('my_tool(x="a")') == "v1"
+    interp.tools["my_tool"] = tool_v2
+    interp._tools_registered = False
+    assert interp.execute('my_tool(x="b")') == "v2"
 
-    with dspy.context(callbacks=[Recorder()]):
-        interp.execute('my_tool(x="a")')
 
-        # Replace tool (as RLM does between forward() calls)
-        interp._tools["my_tool"] = tool_v2
-        interp._tool_instances.clear()
-        interp.execute('my_tool(x="b")')
+# --- Error classes (dspy >= 3.3.0) ---
 
-    assert len(instances) == 2
-    assert instances[0].func is tool_v1
-    assert instances[1].func is tool_v2
+
+def test_runtime_error_is_code_execution_error():
+    """Errors in submitted code are recoverable: RLM only feeds
+    CodeExecutionError (not bare CodeInterpreterError) back to the LM."""
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    interp = MontyInterpreter()
+    with pytest.raises(CodeExecutionError, match="ZeroDivisionError"):
+        interp.execute("1/0")
+    # Session survives a recoverable error.
+    interp.execute("x = 1")
+    assert interp.execute("x") == "1"
+
+
+def test_tool_error_is_code_execution_error():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    def bad_tool() -> str:
+        raise ValueError("boom")
+
+    interp = MontyInterpreter(tools={"bad_tool": bad_tool})
+    with pytest.raises(CodeExecutionError, match="boom"):
+        interp.execute("bad_tool()")
+
+
+def test_memory_limit_error_is_code_execution_error():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+    from pydantic_monty import ResourceLimits
+
+    interp = MontyInterpreter(resource_limits=ResourceLimits(max_memory=50_000_000))
+    with pytest.raises(CodeExecutionError, match="MemoryError"):
+        interp.execute("y = [0] * 100_000_000")
+
+
+def test_worker_crash_is_terminal_code_interpreter_error():
+    """A dead worker (timeout) is NOT recoverable: bare CodeInterpreterError,
+    not CodeExecutionError, so RLM aborts instead of retrying."""
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    interp = MontyInterpreter(request_timeout=0.5)
+    with pytest.raises(CodeInterpreterError) as info:
+        interp.execute("while True:\n    pass")
+    assert not isinstance(info.value, CodeExecutionError)
+
+
+# --- SUBMIT halts execution ---
+
+
+def test_submit_halts_execution():
+    """Nothing after SUBMIT() runs: no prints, no assignments."""
+    interp = MontyInterpreter()
+    interp.execute("x = 1")
+    result = interp.execute("SUBMIT(answer=x)\nprint('after')\nx = 2")
+    assert result == FinalOutput({"answer": 1})
+    assert interp.execute("x") == "1"
+
+
+def test_submit_halts_inside_loop():
+    interp = MontyInterpreter()
+    result = interp.execute(
+        "hits = []\nfor i in range(10):\n    hits.append(i)\n    if i == 2:\n        SUBMIT(answer=i)"
+    )
+    assert result == FinalOutput({"answer": 2})
+    assert interp.execute("print(hits)") == "[0, 1, 2]"
+
+
+# --- execution_instructions (dspy >= 3.3.1) ---
+
+
+def test_execution_instructions_is_class_attribute_string():
+    """RLM reads it off the factory (the class), not an instance."""
+    assert isinstance(MontyInterpreter.execution_instructions, str)
+    assert MontyInterpreter.execution_instructions.strip()
+
+
+def test_execution_instructions_describe_monty_limitations():
+    text = MontyInterpreter.execution_instructions
+    assert "match" in text
+    assert "State persists" in text
+    for mod in ("re", "json", "math", "datetime", "collections", "itertools", "dataclasses"):
+        assert f"`{mod}`" in text or f" {mod}," in text or f" {mod}." in text or f" {mod} " in text
+    assert "pip" in text or "third-party" in text
+    assert "network" in text
+    # Monty cannot pass builtin methods as values (max(d, key=d.get) fails).
+    assert "key=d.get" in text
+    assert "decimal" in text
 
 
 # --- pydantic-monty 0.0.18 regressions ---
@@ -888,6 +1031,22 @@ def test_user_defined_class():
     assert interp.execute("c.bump()\nc.bump()\nprint(c.bump())") == "3"
 
 
+def test_max_memory_limit_raises_and_keeps_state():
+    """A max_memory violation surfaces as CodeInterpreterError (MemoryError
+    in the sandbox) and, unlike a worker crash, the session keeps its state."""
+    from pydantic_monty import ResourceLimits
+
+    interp = MontyInterpreter(resource_limits=ResourceLimits(max_memory=50_000_000))
+    interp.start()
+    try:
+        interp.execute("x = 42")
+        with pytest.raises(CodeInterpreterError, match="MemoryError"):
+            interp.execute("y = [0] * 100_000_000")
+        assert interp.execute("x") == "42"
+    finally:
+        interp.shutdown()
+
+
 def test_worker_crash_raises_and_recovers():
     """A crashed worker (here: exceeding request_timeout) surfaces as
     CodeInterpreterError, and the interpreter recovers with a fresh
@@ -911,3 +1070,194 @@ def test_external_function_identity():
     assert interp.execute("f = my_tool\nprint(f is my_tool)") == "True"
     assert interp.execute("f = my_tool\nprint(f == my_tool)") == "True"
     assert interp.execute("print(SUBMIT is SUBMIT)") == "True"
+
+
+# --- RLM integration (no LM needed) ---
+
+
+def test_rlm_accepts_class_as_interpreter_factory():
+    import dspy
+
+    assert isinstance(MontyInterpreter(), dspy.CodeInterpreter)
+    rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter)
+    assert "match statements are NOT supported" in rlm.generate_action.signature.instructions
+
+
+def test_rlm_feeds_runtime_errors_back_to_the_lm():
+    """RLM._execute_code turns CodeExecutionError into an '[Error] ...' string
+    (a correction turn) but lets a terminal CodeInterpreterError propagate."""
+    import dspy
+
+    rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter)
+    interp = MontyInterpreter(request_timeout=0.5)
+    try:
+        result = rlm._execute_code(interp, "1/0", {})
+        assert isinstance(result, str) and result.startswith("[Error]")
+        assert "ZeroDivisionError" in result
+
+        with pytest.raises(CodeInterpreterError):
+            rlm._execute_code(interp, "while True:\n    pass", {})
+    finally:
+        interp.shutdown()
+
+
+# --- MontyInterpreter.factory() and conditional execution_instructions ---
+
+
+def test_factory_returns_configured_instances():
+    factory = MontyInterpreter.factory(request_timeout=1.5)
+    interp = factory()
+    assert isinstance(interp, MontyInterpreter)
+    assert interp._request_timeout == 1.5
+    assert factory() is not interp
+
+
+def test_factory_carries_execution_instructions():
+    """A plain lambda has no execution_instructions, so RLM would fall back
+    to an empty prompt section; factory() must expose one."""
+    factory = MontyInterpreter.factory()
+    assert factory.execution_instructions == MontyInterpreter.execution_instructions
+    assert "Monty" in factory.execution_instructions
+
+
+def test_instructions_without_mounts_say_filesystem_unavailable():
+    text = MontyInterpreter.factory().execution_instructions
+    assert "filesystem is unavailable" in text
+    assert "Mounted" not in text
+
+
+def test_instructions_with_mounts_describe_paths_modes_and_contents(tmp_path):
+    reports = tmp_path / "reports"
+    (reports / "q3").mkdir(parents=True)
+    (reports / "readme.md").write_text("notes")
+    (reports / "q3" / "forecast.txt").write_text("forecast")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    factory = MontyInterpreter.factory(
+        mounts=[
+            MountDir(host_path=str(reports), virtual_path="/data", mode="read-only"),
+            MountDir(host_path=str(scratch), virtual_path="/scratch", mode="overlay"),
+        ]
+    )
+    text = factory.execution_instructions
+    assert "filesystem is unavailable" not in text
+    assert "/data (read-only)" in text
+    assert "q3/" in text and "readme.md" in text
+    assert "/scratch (overlay" in text and "discarded" in text
+    assert "(empty)" in text
+    assert "os.listdir" in text and "Path" in text
+    assert "os.walk" in text and "os.path" in text  # named as unavailable
+    # The factory's instances carry the same text.
+    assert factory().execution_instructions == text
+
+
+def _mount_line(text: str, virtual_path: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith(f"- {virtual_path} "))
+
+
+def test_instructions_small_dir_lists_every_entry(tmp_path):
+    for i in range(20):
+        (tmp_path / f"f{i:02d}.txt").write_text("x")
+    line = _mount_line(
+        MontyInterpreter.factory(mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")).execution_instructions,
+        "/d",
+    )
+    assert "f00.txt" in line and "f19.txt" in line
+
+
+def test_instructions_large_dir_is_summarized_not_listed(tmp_path):
+    for i in range(40):
+        (tmp_path / f"f{i:02d}.csv").write_text("x")
+    for i in range(3):
+        (tmp_path / f"notes{i}.md").write_text("x")
+    (tmp_path / "sub").mkdir()
+    line = _mount_line(
+        MontyInterpreter.factory(mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")).execution_instructions,
+        "/d",
+    )
+    assert "43 files and 1 directory" in line
+    assert ".csv ×40" in line and ".md ×3" in line
+    assert "e.g. f00.csv" in line
+    assert "f39.csv" not in line
+    assert len(line) < 320
+
+
+def test_instructions_truncate_long_names(tmp_path):
+    (tmp_path / ("a" * 120 + ".txt")).write_text("x")
+    line = _mount_line(
+        MontyInterpreter.factory(mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")).execution_instructions,
+        "/d",
+    )
+    assert "a" * 120 not in line
+    assert "…" in line
+    assert len(line) < 120
+
+
+def test_instructions_respect_character_budget_per_mount(tmp_path):
+    # 20 entries of 40 chars each would be ~850 chars as a plain list.
+    for i in range(20):
+        (tmp_path / (f"{i:02d}_" + "x" * 37)).write_text("x")
+    line = _mount_line(
+        MontyInterpreter.factory(mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")).execution_instructions,
+        "/d",
+    )
+    assert len(line) <= 320
+    assert "more" in line
+
+
+def test_instructions_listing_can_be_disabled(tmp_path):
+    (tmp_path / "secret.txt").write_text("x")
+    text = MontyInterpreter.factory(
+        mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only"),
+        mount_listing_limit=0,
+    ).execution_instructions
+    assert "- /d (read-only)" in text
+    assert "secret.txt" not in text
+    assert "containing" not in text
+
+
+def test_instructions_listing_limit_is_configurable(tmp_path):
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("x")
+    text = MontyInterpreter(
+        mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only"),
+        mount_listing_limit=3,
+    ).execution_instructions
+    assert "5 files" in text and "f4.txt" not in text
+
+
+def test_instructions_scan_is_bounded(tmp_path):
+    import dspy_monty_interpreter.interpreter as mod
+
+    for i in range(mod._MOUNT_SCAN_LIMIT + 5):
+        (tmp_path / f"{i}.txt").write_text("x")
+    line = _mount_line(
+        MontyInterpreter.factory(mounts=MountDir(host_path=str(tmp_path), virtual_path="/d", mode="read-only")).execution_instructions,
+        "/d",
+    )
+    assert f"{mod._MOUNT_SCAN_LIMIT:,}+ entries" in line
+
+
+def test_instructions_tolerate_unreadable_host_path(tmp_path):
+    """MountDir requires the host path to exist, but it can vanish before
+    the factory is built; describe the mount anyway."""
+    later = tmp_path / "later"
+    later.mkdir()
+    mount = MountDir(host_path=str(later), virtual_path="/out", mode="read-write")
+    later.rmdir()
+    text = MontyInterpreter.factory(mounts=mount).execution_instructions
+    assert "/out (read-write" in text
+    assert "not readable" in text
+
+
+def test_rlm_prompt_includes_mount_description(tmp_path):
+    import dspy
+
+    (tmp_path / "a.csv").write_text("x")
+    factory = MontyInterpreter.factory(
+        mounts=MountDir(host_path=str(tmp_path), virtual_path="/data", mode="read-only")
+    )
+    rlm = dspy.RLM("q -> a", interpreter_factory=factory)
+    instructions = rlm.generate_action.signature.instructions
+    assert "/data (read-only)" in instructions and "a.csv" in instructions

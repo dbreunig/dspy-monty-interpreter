@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`, `math`, `unicodedata`) and can't yet use match statements. It does support classes (as of Monty 0.0.19), `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `dataclasses`) and can't yet use match statements. It does support classes, decorators, `@dataclass`, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -12,7 +12,7 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `pydantic-monty>=0.0.19`.
+Requires `dspy>=3.3.1` and `pydantic-monty>=0.0.20`.
 
 ## Usage
 
@@ -20,33 +20,27 @@ Requires `pydantic-monty>=0.0.19`.
 import dspy
 from dspy_monty_interpreter import MontyInterpreter
 
-interpreter = MontyInterpreter()
-rlm = dspy.RLM("context -> answer", interpreter=interpreter)
+rlm = dspy.RLM("context -> answer", interpreter_factory=MontyInterpreter)
 result = rlm(context="What is 2 + 2?")
 ```
 
-### Standalone usage
+DSPy calls `interpreter_factory` once per `forward()` and shuts the interpreter down afterwards. To configure the interpreter, use `MontyInterpreter.factory(...)`, which takes the same arguments as the constructor:
 
 ```python
-from dspy_monty_interpreter import MontyInterpreter
-
-interp = MontyInterpreter()
-
-# Basic execution
-interp.execute("x = 42")
-interp.execute("print(x + 8)")  # returns "50"
-
-# State persists across calls
-interp.execute("def double(n):\n    return n * 2")
-interp.execute("double(21)")  # returns "42"
-
-# With tools
-def lookup(key: str) -> str:
-    return "some value"
-
-interp = MontyInterpreter(tools={"lookup": lookup})
-interp.execute('result = lookup(key="foo")\nprint(result)')
+rlm = dspy.RLM(
+    "context -> answer",
+    interpreter_factory=MontyInterpreter.factory(request_timeout=10.0),
+)
 ```
+
+To reuse one interpreter across calls instead (DSPy 3.2's `interpreter=` constructor argument), pass it an instance of `MontyInterpreter` as the first positional argument when calling the module. RLM injects its tools into it but never shuts it down, which is the same contract as before; only the call site moved:
+
+```python
+interpreter = MontyInterpreter(request_timeout=10.0)
+result = rlm(interpreter, context="What is 2 + 2?")
+```
+
+Keep `interpreter_factory=MontyInterpreter` on the RLM even when you pass an interpreter positionally. RLM builds its action prompt once, at construction time, from the factory's `execution_instructions`; the interpreter you pass at call time is too late to affect it.
 
 ## Filesystem access
 
@@ -64,15 +58,25 @@ For a typical agent, mount the files you want the model to explore as read-only,
 import dspy
 from dspy_monty_interpreter import MontyInterpreter, MountDir
 
-interpreter = MontyInterpreter(mounts=[
+factory = MontyInterpreter.factory(mounts=[
     MountDir(virtual_path="/data", host_path="./reports", mode="read-only"),
     MountDir(virtual_path="/scratch", host_path="./scratch", mode="overlay"),
 ])
-rlm = dspy.RLM("question -> answer", interpreter=interpreter)
+rlm = dspy.RLM("question -> answer", interpreter_factory=factory)
 result = rlm(question="Which report mentions the Q3 forecast?")
 ```
 
 The model can read every file under `./reports` through `/data`, and it can write freely under `/scratch` during each `execute()` call, but nothing it writes ever reaches your disk.
+
+Because the factory knows about the mounts, its `execution_instructions` tell the model what is there. For the example above the prompt gains a section like:
+
+```
+Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir(), and open(path); os.path and os.walk are not available):
+- /data (read-only) containing q3/, readme.md
+- /scratch (overlay: writable, but writes are discarded when each execution ends) containing (empty)
+```
+
+The listing is a snapshot of each host directory's top level at the time the factory is created, and it is bounded so a large mount cannot bloat the prompt. Up to 20 entries (`mount_listing_limit`) are listed by name; beyond that the model gets a summary instead, for example `1,204 files and 1 directory (.csv ×1200, .md ×4; e.g. 0000.csv, 0001.csv, 0002.csv)`. Individual names are cut at 40 characters, each mount's description at roughly 300, and the directory scan stops at 5,000 entries. Pass `mount_listing_limit=0` to describe only the path and mode. Without mounts the section says the filesystem is unavailable, so the model does not go looking for one. To reuse one interpreter across calls, pass it positionally (`rlm(factory(), question=...)`); the instance carries the same `execution_instructions` if you need them elsewhere.
 
 Overlay mode also works well as pure scratch space in standalone use:
 
@@ -96,6 +100,20 @@ Two things to know about overlays. First, as of Monty 0.0.19 an overlay only liv
 
 For a fully virtual filesystem, environment variables, or control over the clock, pass an `AbstractOS` implementation as the `os_access` parameter. See the [Monty documentation](https://github.com/pydantic/monty) for details.
 
+## Resource limits
+
+Pass a `ResourceLimits` dict to cap what each `execute()` call may consume. The most useful knob is `max_memory` (bytes): as of Monty 0.0.20 it is enforced by the interpreter's allocator, so a runaway allocation raises a `MemoryError` inside the sandbox instead of exhausting the host.
+
+```python
+from pydantic_monty import ResourceLimits
+
+interp = MontyInterpreter(
+    resource_limits=ResourceLimits(max_memory=256 * 1024 * 1024)
+)
+```
+
+Other keys are `max_duration_secs`, `max_recursion_depth`, and `gc_interval`. Every key is optional; omit it to leave that limit off. A limit violation surfaces as a `CodeExecutionError` from `execute()`, and the session keeps its state, unlike a `request_timeout` (below), which discards it.
+
 ## Timeouts
 
 Pass `request_timeout` to set a hard limit, in seconds, on each `execute()` call:
@@ -104,7 +122,7 @@ Pass `request_timeout` to set a hard limit, in seconds, on each `execute()` call
 interp = MontyInterpreter(request_timeout=10.0)
 ```
 
-When code exceeds the limit, `execute()` raises `CodeInterpreterError`. The session state is lost, and the next `execute()` starts fresh.
+When code exceeds the limit, `execute()` raises `CodeInterpreterError`. The session state is lost, and the next `execute()` starts fresh. (Ordinary runtime errors in the code raise `CodeExecutionError`, a subclass that RLM feeds back to the model as a correction turn; a timeout is terminal and ends the RLM run.)
 
 ## Parallel evaluation
 
@@ -112,12 +130,19 @@ A single `MontyInterpreter` is safe to share across threads, which is exactly wh
 
 ```python
 interpreter = MontyInterpreter(max_processes=8)
-rlm = dspy.RLM("question -> answer", interpreter=interpreter)
+rlm = dspy.RLM("question -> answer", interpreter_factory=MontyInterpreter)
+program = lambda **inputs: rlm(interpreter, **inputs)
 evaluate = dspy.Evaluate(devset=devset, num_threads=8, metric=metric)
-evaluate(rlm)
+evaluate(program)
 ```
 
+Passing the interpreter positionally is what shares the pool. With `interpreter_factory` alone, every `forward()` spins up and tears down its own worker pool, which works but is slower. DSPy documents a caller-owned interpreter as safe only for sequential calls; `MontyInterpreter`'s per-thread sessions are what make the concurrent case work, and the e2e suite exercises it.
+
 The pool caps live workers at `max_processes`, which defaults to your CPU count. A thread holds its worker between `execute()` calls, so when `num_threads` is higher than your CPU count, set `max_processes` to at least `num_threads`. Otherwise threads at the tail of a run can wait on workers that idle threads still hold.
+
+## Observability
+
+`MontyInterpreter` fires DSPy's interpreter lifecycle callbacks: `on_interpreter_startup_*`, `on_interpreter_execute_*`, `on_interpreter_tool_call_*`, and `on_interpreter_shutdown_*`. Register a `dspy.utils.callback.BaseCallback` globally with `dspy.configure(callbacks=[...])` or per instance with `MontyInterpreter(callbacks=[...])`. Tool calls nest under the `execute()` call that made them, so traces keep their ancestry.
 
 ## Why Monty?
 

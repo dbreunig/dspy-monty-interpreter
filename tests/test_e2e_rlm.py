@@ -20,7 +20,6 @@ import dspy
 
 from dspy_monty_interpreter import MontyInterpreter
 
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if load_dotenv is not None:
@@ -50,11 +49,10 @@ def test_rlm_computes_via_monty():
     """RLM should pick Monty, write Python, and return the right answer."""
     dspy.configure(lm=_select_lm())
 
-    interpreter = MontyInterpreter()
     rlm = dspy.RLM(
         "numbers: list[int] -> product: int",
-        interpreter=interpreter,
-        max_iterations=5,
+        interpreter_factory=MontyInterpreter,
+        max_iters=5,
         max_llm_calls=3,
     )
 
@@ -80,12 +78,11 @@ def test_rlm_with_custom_tool():
             "lagos": "15388000",
         }.get(city.lower(), "0")
 
-    interpreter = MontyInterpreter(tools={"lookup_city_population": lookup_city_population})
     rlm = dspy.RLM(
         "city: str -> population: int",
-        interpreter=interpreter,
+        interpreter_factory=MontyInterpreter,
         tools=[lookup_city_population],
-        max_iterations=5,
+        max_iters=5,
         max_llm_calls=3,
     )
 
@@ -108,14 +105,14 @@ def test_rlm_parallel_forwards_share_one_interpreter():
     interpreter = MontyInterpreter()
     rlm = dspy.RLM(
         "numbers: list[int] -> total: int",
-        interpreter=interpreter,
-        max_iterations=5,
+        interpreter_factory=MontyInterpreter,
+        max_iters=5,
         max_llm_calls=3,
     )
 
     inputs = [[1, 2, 3], [10, 20], [100, 200, 300]]
     with ThreadPoolExecutor(max_workers=3) as ex:
-        results = list(ex.map(lambda nums: rlm(numbers=nums), inputs))
+        results = list(ex.map(lambda nums: rlm(interpreter, numbers=nums), inputs))
 
     assert [int(r.total) for r in results] == [6, 30, 600]
     interpreter.shutdown()
