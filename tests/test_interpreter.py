@@ -821,6 +821,12 @@ def test_memory_limit_error_is_code_execution_error():
         interp.execute("y = [0] * 100_000_000")
 
 
+def test_unknown_resource_limit_key_is_rejected():
+    interp = MontyInterpreter(resource_limits={"bogus": 1})
+    with pytest.raises(ValueError, match="bogus"):
+        interp.execute("1")
+
+
 def test_worker_crash_is_terminal_code_interpreter_error():
     """A dead worker (timeout) is NOT recoverable: bare CodeInterpreterError,
     not CodeExecutionError, so RLM aborts instead of retrying."""
@@ -866,7 +872,7 @@ def test_execution_instructions_describe_monty_limitations():
     text = MontyInterpreter.execution_instructions
     assert "match" in text
     assert "State persists" in text
-    for mod in ("re", "json", "math", "datetime", "collections", "itertools", "dataclasses"):
+    for mod in ("re", "json", "math", "datetime", "collections", "itertools", "functools", "dataclasses", "base64"):
         assert f"`{mod}`" in text or f" {mod}," in text or f" {mod}." in text or f" {mod} " in text
     assert "pip" in text or "third-party" in text
     assert "network" in text

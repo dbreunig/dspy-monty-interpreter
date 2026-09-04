@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `dataclasses`) and can't yet use match statements. It does support classes, decorators, `@dataclass`, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `base64`) and can't yet use match statements. It does support classes, decorators, `@dataclass` (including `frozen=` and `eq=`), `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -12,7 +12,7 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `dspy>=3.3.1` and `pydantic-monty>=0.0.20`.
+Requires `dspy>=3.3.1` and `pydantic-monty>=0.0.22`.
 
 ## Usage
 
@@ -112,7 +112,7 @@ interp = MontyInterpreter(
 )
 ```
 
-Other keys are `max_duration_secs`, `max_recursion_depth`, and `gc_interval`. Every key is optional; omit it to leave that limit off. A limit violation surfaces as a `CodeExecutionError` from `execute()`, and the session keeps its state, unlike a `request_timeout` (below), which discards it.
+Other keys are `max_duration_secs`, `max_recursion_depth`, `max_suspensions`, and `gc_interval`. Every key is optional; omit it to leave that limit off. Monty rejects unknown keys with a `ValueError` on the first `execute()`. A limit violation surfaces as a `CodeExecutionError` from `execute()`, and the session keeps its state, unlike a `request_timeout` (below), which discards it.
 
 ## Timeouts
 
