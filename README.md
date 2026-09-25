@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-The Monty team points out, "This project is still in development, and not ready for the prime time." It uses a small subset of the standard library (`sys`, `os`, `typing`, `asyncio`, `re`, `datetime`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `base64`) and can't yet use match statements. It does support classes, decorators, `@dataclass` (including `frozen=` and `eq=`), `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`) and can't yet use match statements, generator functions (`yield`), or class inheritance. It does support classes, decorators, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -12,7 +12,7 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `dspy>=3.3.1` and `pydantic-monty>=0.0.23`.
+Requires `dspy>=3.3.1` and `pydantic-monty>=1.0.0`. Since 1.0, `pydantic-monty` is a metapackage that installs `pydantic-monty-client` (the Python bindings) and `pydantic-monty-runtime` (the `monty` worker binary). If the binary comes from somewhere else, such as a base image, install `pydantic-monty-client` alone and point it at the binary with the `MONTY_BIN` environment variable.
 
 ## Usage
 
@@ -76,6 +76,8 @@ Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir()
 - /scratch (overlay: writable, but writes are discarded when each execution ends) containing (empty)
 ```
 
+The sandbox's working directory starts at the first mount's virtual path (`/data` above, or `/` without mounts), so relative paths like `open('q3/summary.md')` resolve inside it, and `os.chdir()` persists across `execute()` calls.
+
 The listing is a snapshot of each host directory's top level at the time the factory is created, and it is bounded so a large mount cannot bloat the prompt. Up to 20 entries (`mount_listing_limit`) are listed by name; beyond that the model gets a summary instead, for example `1,204 files and 1 directory (.csv ×1200, .md ×4; e.g. 0000.csv, 0001.csv, 0002.csv)`. Individual names are cut at 40 characters, each mount's description at roughly 300, and the directory scan stops at 5,000 entries. Pass `mount_listing_limit=0` to describe only the path and mode. Without mounts the section says the filesystem is unavailable, so the model does not go looking for one. To reuse one interpreter across calls, pass it positionally (`rlm(factory(), question=...)`); the instance carries the same `execution_instructions` if you need them elsewhere.
 
 Overlay mode also works well as pure scratch space in standalone use:
@@ -96,13 +98,33 @@ interp.execute(
 # The host directory is still empty.
 ```
 
-Two things to know about overlays. First, as of Monty 0.0.19 an overlay only lives for the duration of a single `execute()` call. Code that writes a file must read it back in the same call. Use `read-write` mode when files need to survive across calls. Second, overlay writes never reach the host, so the only way to get overlay data out is from inside the sandbox. Have the code `print()` or `SUBMIT()` the results, or use `read-write` mode when you need real files on disk.
+Two things to know about overlays. First, an overlay only lives for the duration of a single `execute()` call. Code that writes a file must read it back in the same call. Use `read-write` mode when files need to survive across calls. Second, overlay writes never reach the host, so the only way to get overlay data out is from inside the sandbox. Have the code `print()` or `SUBMIT()` the results, or use `read-write` mode when you need real files on disk.
 
-For a fully virtual filesystem, environment variables, or control over the clock, pass an `AbstractOS` implementation as the `os_access` parameter. See the [Monty documentation](https://github.com/pydantic/monty) for details.
+For a fully virtual filesystem or environment variables, pass an `AbstractOS` implementation (such as `pydantic_monty.OSAccess`) as the `os_access` parameter. See the [Monty documentation](https://github.com/pydantic/monty) for details. To control the clock, see [Clock, sleep, and randomness](#clock-sleep-and-randomness).
+
+## Clock, sleep, and randomness
+
+The sandbox answers `datetime.now()`, `date.today()`, `time.time()`, and `random` from the worker's own clock and entropy, in UTC. Pass an `OSPolicy` dict as `os_policy` to change that, for example to freeze the clock and seed `random` so an RLM run is reproducible:
+
+```python
+from datetime import datetime
+
+interp = MontyInterpreter(
+    os_policy={
+        "datetime": datetime(2026, 1, 1, 12, 0),
+        "timezone": "America/Los_Angeles",
+        "random_start": {"seed": 42},
+    }
+)
+```
+
+`MontyInterpreter` sets `sleep` to `"zero"` by default, so `time.sleep()` and `asyncio.sleep()` return immediately instead of holding a worker (Monty otherwise waits, capped at ten seconds per call). Pass `os_policy={"sleep": "system"}` to restore real waits. Keys you leave out keep this default and Monty's.
+
+An `os_access` object's `datetime_now()` and `date_today()` overrides are only consulted when `os_policy` routes the clock to the host: `os_policy={"datetime": "call_host"}`. Before Monty 1.0 they were called unconditionally, so upgrade any code that relied on that.
 
 ## Resource limits
 
-Pass a `ResourceLimits` dict to cap what each `execute()` call may consume. The most useful knob is `max_memory` (bytes): as of Monty 0.0.20 it is enforced by the interpreter's allocator, so a runaway allocation raises a `MemoryError` inside the sandbox instead of exhausting the host.
+Pass a `ResourceLimits` dict to cap what each `execute()` call may consume. The most useful knob is `max_memory` (bytes): the interpreter's allocator enforces it, so a runaway allocation raises a `MemoryError` inside the sandbox instead of exhausting the host.
 
 ```python
 from pydantic_monty import ResourceLimits
@@ -112,7 +134,9 @@ interp = MontyInterpreter(
 )
 ```
 
-Other keys are `max_duration_secs`, `max_recursion_depth`, `max_suspensions`, and `gc_interval`. Every key is optional; omit it to leave that limit off. Monty rejects unknown keys with a `ValueError` on the first `execute()`. A limit violation surfaces as a `CodeExecutionError` from `execute()`, and the session keeps its state, unlike a `request_timeout` (below), which discards it.
+Two keys cap execution time: `max_feed_duration_secs` limits one `execute()` call, and `max_turn_duration_secs` limits the sandbox time between tool calls. Both count only time spent running sandboxed code, not time waiting on your tools. Other keys are `max_recursion_depth` and `max_suspensions` (both default to 1000 and cannot be disabled), `max_total_sleep_secs`, and `gc_interval`. Monty rejects unknown keys with a `ValueError` on the first `execute()`.
+
+A limit violation surfaces as a `CodeExecutionError` from `execute()`, which RLM feeds back to the model. After a memory, recursion, or suspension limit the session keeps its state. After a time limit Monty makes no guarantees about the sandbox heap, so the adapter discards the session: the next `execute()` starts with empty state, and the error message tells the model so.
 
 ## Timeouts
 
@@ -146,7 +170,7 @@ The pool caps live workers at `max_processes`, which defaults to your CPU count.
 
 ## Why Monty?
 
-- **Fast**: No WASM bootstrap. Code runs against a pool of warm `monty` worker processes (as of Monty 0.0.19)
+- **Fast**: No WASM bootstrap. Code runs against a pool of warm `monty` worker processes
 - **Secure**: No filesystem, network, or environment access unless you grant it (see [Filesystem access](#filesystem-access))
 - **Resilient**: A crashed or timed-out worker is replaced automatically without taking down your process
 - **Lightweight**: Pure Rust, no Deno/Pyodide dependency

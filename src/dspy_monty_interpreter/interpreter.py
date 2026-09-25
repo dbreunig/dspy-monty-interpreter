@@ -23,6 +23,7 @@ from pydantic_monty import (
     MontySession,
     MontySyntaxError,
     MountDir,
+    OSPolicy,
     ResourceLimits,
 )
 
@@ -46,13 +47,16 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "step are available in later steps. "
         "Nothing is pre-imported; write the import statements you need. "
         "Only these standard-library modules can be imported: re, json, math, datetime, "
-        "collections, itertools, functools, dataclasses, base64, typing, sys, os, asyncio, "
-        "unicodedata. "
-        "Other stdlib modules (decimal, statistics, csv, operator, ...) and all "
+        "time, random, collections, itertools, functools, dataclasses, copy, base64, "
+        "binascii, typing, sys, os, pathlib, asyncio, unicodedata. "
+        "Other stdlib modules (decimal, statistics, csv, operator, string, ...) and all "
         "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
-        "There is no network access, no subprocesses, and no environment variables. "
+        "There is no network access, no subprocesses, and no environment variables; "
+        "datetime.now() and time.time() do work. "
         "Supported syntax includes classes, decorators, @dataclass, comprehensions, "
-        "generators, with statements, and try/except; match statements are NOT supported. "
+        "generator expressions, lambdas, with statements, and try/except; match statements "
+        "are NOT supported, nor are generator functions (yield), class inheritance "
+        "(including subclassing Exception), or a callable replacement in re.sub(). "
         "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
         "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
         "max(d, key=lambda k: d[k]) or max(d.items(), key=lambda kv: kv[1]). "
@@ -63,6 +67,8 @@ _BASE_EXECUTION_INSTRUCTIONS = (
     )
 
 _NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted."
+
+_DEFAULT_OS_POLICY: OSPolicy = {"sleep": "zero"}
 
 _MOUNT_MODE_DESCRIPTIONS = {
     "read-only": "read-only",
@@ -197,18 +203,28 @@ class MontyInterpreter:
 
     Monty is a secure Python interpreter written in Rust. Unlike the default
     PythonInterpreter (Deno/Pyodide), Monty has no WASM bootstrap and provides
-    strict sandboxing with no network or environment access. As of Monty
-    0.0.19, code runs in a pool of ``monty`` worker subprocesses: a crashed
-    or timed-out worker is replaced transparently without taking down the
-    host process. Filesystem access can be enabled per-interpreter via the
-    ``mounts`` parameter.
+    strict sandboxing with no network or environment access. Code runs in a
+    pool of ``monty`` worker subprocesses: a crashed or timed-out worker is
+    replaced transparently without taking down the host process. Filesystem
+    access can be enabled per-interpreter via the ``mounts`` parameter.
 
     Pass ``resource_limits`` (a ``pydantic_monty.ResourceLimits`` dict) to
     cap each ``execute()`` call. ``max_memory`` (bytes) is enforced by
-    Monty's allocator as of 0.0.20, so a runaway allocation raises
-    ``MemoryError`` in the sandbox rather than on the host; it surfaces as
-    ``CodeExecutionError`` and the session keeps its state. Other keys:
-    ``max_duration_secs``, ``max_recursion_depth``, ``gc_interval``.
+    Monty's allocator, so a runaway allocation raises ``MemoryError`` in the
+    sandbox rather than on the host; it surfaces as ``CodeExecutionError``
+    and the session keeps its state. ``max_feed_duration_secs`` caps one
+    ``execute()`` call and ``max_turn_duration_secs`` caps the sandbox time
+    between host calls; Monty makes no guarantees about the heap after
+    either fires, so the adapter discards the session and the next
+    ``execute()`` starts with empty state. Other keys: ``max_recursion_depth``,
+    ``max_suspensions``, ``max_total_sleep_secs``, ``gc_interval``.
+
+    Pass ``os_policy`` (a ``pydantic_monty.OSPolicy`` dict) to control the
+    sandbox's clock, timezone, sleep, and random seed. The adapter defaults
+    ``sleep`` to ``'zero'`` so ``time.sleep()`` returns immediately instead
+    of holding a worker; pass ``{'sleep': 'system'}`` to restore real
+    waits. Clock overrides on an ``os_access`` object are only consulted
+    when ``os_policy`` selects ``'call_host'`` for ``datetime``.
 
     State persists across ``execute()`` calls via ``MontySession``, Monty's
     incremental REPL session — each snippet is compiled and run against
@@ -256,6 +272,7 @@ class MontyInterpreter:
         max_processes: int | None = None,
         callbacks: list[BaseCallback] | None = None,
         mount_listing_limit: int = _MOUNT_LISTING_LIMIT,
+        os_policy: OSPolicy | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
@@ -263,6 +280,9 @@ class MontyInterpreter:
         self._resource_limits: ResourceLimits | None = resource_limits
         self._mounts: MountDir | list[MountDir] | None = mounts
         self._os_access: AbstractOS | None = os_access
+        # Sandbox code has nothing to wait for, so sleeping only holds a
+        # worker (Monty caps each system sleep at 10s); callers opt back in.
+        self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
         self._pool: Monty | None = None
@@ -316,7 +336,7 @@ class MontyInterpreter:
                     )
                     self._pool.__enter__()
                 pool = self._pool
-            session = pool.checkout(limits=self._resource_limits)
+            session = pool.checkout(limits=self._resource_limits, os_policy=self._os_policy)
             session.__enter__()
             local.session = session
             with self._lock:
@@ -463,7 +483,14 @@ class MontyInterpreter:
                 self._has_state = True
                 args, kwargs = submit_box[0]
                 return _handle_submit(args, kwargs, self.output_fields)
-            raise CodeExecutionError(e.display("type-msg")) from e
+            message = e.display("type-msg")
+            if _is_time_limit(e):
+                # A feed or turn time limit stops the sandbox mid-operation
+                # and Monty makes no guarantees about its heap afterwards:
+                # discard the session so the next execute() starts clean.
+                self._discard_session()
+                message += "; the sandbox was reset and all variables were lost"
+            raise CodeExecutionError(message) from e
 
         self._has_state = True
 
@@ -526,6 +553,12 @@ def _handle_submit(
     if len(args) == 0:
         return FinalOutput(None)
     return FinalOutput(args[0])
+
+
+def _is_time_limit(e: MontyRuntimeError) -> bool:
+    """True when ``max_feed_duration_secs`` or ``max_turn_duration_secs``
+    stopped the sandbox, as opposed to code raising ``TimeoutError`` itself."""
+    return isinstance(e.exception(), TimeoutError) and "time limit exceeded" in e.display("msg")
 
 
 def _strip_code_fences(code: str) -> str:
