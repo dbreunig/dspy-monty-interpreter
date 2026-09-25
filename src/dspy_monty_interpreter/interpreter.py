@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import inspect
 import os
 import re
 import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Literal
 
 from dspy.primitives.code_interpreter import (
@@ -230,25 +233,28 @@ class MontyInterpreter:
     incremental REPL session — each snippet is compiled and run against
     the persistent heap and namespace without replaying prior snippets.
 
-    Sessions are per-thread: concurrent ``execute()`` calls from different
-    threads (e.g. ``dspy.Evaluate`` / ``dspy.Parallel`` running the same RLM
-    with ``num_threads``) each get their own isolated session, all sharing
-    one worker pool. RLM's per-forward reset discards only the calling
-    thread's session. For thread counts above your CPU count, pass
-    ``max_processes`` so the pool has one worker per thread.
-
-    Usage with RLM::
+    Usage with RLM (DSPy 3.4+)::
 
         # DSPy creates and shuts down one interpreter per forward():
         rlm = dspy.RLM("context -> answer", interpreter_factory=MontyInterpreter)
         result = rlm(context="...")
 
-        # Or pass a caller-owned interpreter positionally and reuse it:
-        interpreter = MontyInterpreter(request_timeout=10.0)
-        result = rlm(interpreter, context="...")
+        # Configure it through the factory, globally or per call:
+        dspy.configure(interpreter_factory=MontyInterpreter.factory(request_timeout=10.0))
+        result = rlm(context="...", interpreter_factory=MontyInterpreter.factory(mounts=[...]))
 
-    ``execution_instructions`` is read off the factory by RLM and added to
-    the action prompt, so the model knows Monty's stdlib and syntax limits.
+    Starting a worker pool costs a few milliseconds, so one interpreter per
+    ``forward()`` is the right default even under ``dspy.Evaluate``. If you
+    drive one instance from several threads yourself, each thread gets its
+    own isolated session on the shared pool; pass ``max_processes`` when
+    the thread count exceeds your CPU count.
+
+    Tools may be coroutine functions: ``invoke_tool`` awaits their result,
+    also when ``execute()`` runs inside an event loop (``RLM.acall``).
+
+    ``execution_instructions`` is read off the active factory by RLM on
+    every action call and added to the prompt, so the model knows Monty's
+    stdlib and syntax limits.
     With ``mounts`` it also describes each mounted directory: path, mode,
     and a bounded view of the top-level contents (names for small
     directories, counts and an extension histogram for large ones; see
@@ -369,7 +375,8 @@ class MontyInterpreter:
         """
         if tool_name not in self._tools:
             raise CodeInterpreterError(f"Unknown tool: {tool_name}")
-        return self._tools[tool_name](**kwargs)
+        result = self._tools[tool_name](**kwargs)
+        return _await_in_sync(result) if inspect.isawaitable(result) else result
 
     def _make_external_fn(self, tool_name: str) -> Callable[..., Any]:
         """Build the callable Monty invokes for ``tool_name``.
@@ -553,6 +560,27 @@ def _handle_submit(
     if len(args) == 0:
         return FinalOutput(None)
     return FinalOutput(args[0])
+
+
+def _await_in_sync(awaitable: Any) -> Any:
+    """Run an awaitable to completion from synchronous code.
+
+    RLM wraps coroutine tools as ``async def`` and calls ``execute()``
+    synchronously even from ``aforward()``, so a loop may already be running
+    in this thread; then the awaitable runs on its own loop in a helper
+    thread, as DSPy's ``LocalInterpreter`` does.
+    """
+
+    async def run() -> Any:
+        return await awaitable
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run())
+    ctx = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(ctx.run, asyncio.run, run()).result()
 
 
 def _is_time_limit(e: MontyRuntimeError) -> bool:

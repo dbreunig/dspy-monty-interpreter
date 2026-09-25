@@ -36,7 +36,7 @@ Project goals (informs the recommendation):
 
 - Stay a **thin** adapter — push capability into Monty, keep wrapping minimal.
 - Track real Monty capability: as Monty grows (more stdlib, match stmts) update README's "limitations" list AND `_BASE_EXECUTION_INSTRUCTIONS` in `interpreter.py`. (Classes work as of 0.0.19; still missing as of 1.0: `match`, `yield`, class inheritance, callable `re.sub` replacement.) Verify by installing the new version and running `import <mod>` / syntax probes through `MontyInterpreter().execute()` rather than trusting release notes.
-- Maintain compatibility with `dspy>=3.0`'s `CodeInterpreter` protocol.
+- Maintain compatibility with `dspy>=3.4`'s `CodeInterpreter` protocol and RLM contract: one interpreter per `forward()` created from `interpreter_factory` (module arg, `dspy.configure`, or call-time kwarg), always shut down by RLM; coroutine tools are wrapped as `async def` and must be awaited in `invoke_tool`.
 - Currently pinned: `pydantic-monty>=1.0.0` in `pyproject.toml` (1.0 split the wheel into `pydantic-monty-client` + `pydantic-monty-runtime`; the metapackage pin still works).
 
 ## Workflow

@@ -1126,6 +1126,67 @@ def test_external_function_identity():
     assert interp.execute("print(SUBMIT is SUBMIT)") == "True"
 
 
+# --- Async tools (dspy >= 3.4 wraps coroutine tools as async def) ---
+
+
+async def _double_async(x: int) -> int:
+    """Async tool stub."""
+    import asyncio
+
+    await asyncio.sleep(0)
+    return x * 2
+
+
+def test_async_tool_result_is_awaited():
+    interp = MontyInterpreter(tools={"double": _double_async})
+    assert interp.execute("double(21)") == "42"
+    interp.shutdown()
+
+
+def test_async_tool_awaited_inside_running_event_loop():
+    """RLM.aforward() still calls execute() synchronously from inside the
+    event loop; the coroutine must run on a helper loop, not deadlock."""
+    import asyncio
+
+    async def main() -> str:
+        interp = MontyInterpreter(tools={"double": _double_async})
+        try:
+            return interp.execute("double(4)")
+        finally:
+            interp.shutdown()
+
+    assert asyncio.run(main()) == "8"
+
+
+def test_async_tool_error_is_code_execution_error():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    async def boom() -> str:
+        raise ValueError("async boom")
+
+    interp = MontyInterpreter(tools={"boom": boom})
+    with pytest.raises(CodeExecutionError, match="async boom"):
+        interp.execute("boom()")
+    interp.shutdown()
+
+
+def test_async_tool_fires_tool_call_callbacks_with_awaited_result():
+    import dspy
+    from dspy.utils.callback import BaseCallback
+
+    seen: list[tuple[str, object]] = []
+
+    class Cb(BaseCallback):
+        def on_interpreter_tool_call_end(self, call_id, outputs, exception=None):
+            seen.append(("end", outputs))
+
+    interp = MontyInterpreter(tools={"double": _double_async}, callbacks=[Cb()])
+    with dspy.context(callbacks=[]):
+        interp.execute("double(5)")
+    interp.shutdown()
+    assert seen == [("end", 10)]
+
+
 # --- Monty 1.0 stdlib and os_policy ---
 
 
@@ -1219,6 +1280,119 @@ def test_rlm_accepts_class_as_interpreter_factory():
     assert isinstance(MontyInterpreter(), dspy.CodeInterpreter)
     rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter)
     assert "match statements are NOT supported" in rlm.generate_action.signature.instructions
+
+
+def _dummy_lm(steps: list[tuple[str, str]]):
+    from dspy.utils.dummies import DummyLM
+
+    return DummyLM([{"reasoning": r, "code": c} for r, c in steps])
+
+
+def test_rlm_forward_runs_tool_and_typed_submit_through_monty():
+    """Full RLM loop on dspy >= 3.4 with a scripted LM: tool call, print
+    output fed back, typed SUBMIT parsed into the output field."""
+    import dspy
+
+    calls: list[str] = []
+
+    def lookup(city: str) -> str:
+        """Population lookup."""
+        calls.append(city)
+        return "2161000"
+
+    lm = _dummy_lm([("look", "pop = lookup('Paris')\nprint(pop)"), ("done", "SUBMIT(population=int(pop))")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("city -> population: int", tools=[lookup], interpreter_factory=MontyInterpreter, max_iters=3)
+        result = rlm(city="Paris")
+    assert result.population == 2161000
+    assert calls == ["Paris"]
+    assert result.trajectory[0]["output"] == "2161000"
+
+
+def test_rlm_call_time_interpreter_factory_override(tmp_path):
+    """dspy >= 3.4: interpreter_factory= at call time overrides the module's
+    factory for that call only, prompt instructions included."""
+    import dspy
+
+    (tmp_path / "note.txt").write_text("from mount")
+    mounted = MontyInterpreter.factory(
+        mounts=MountDir(virtual_path="/data", host_path=str(tmp_path), mode="read-only")
+    )
+    lm = _dummy_lm([("read", "SUBMIT(a=open('/data/note.txt').read())")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter, max_iters=2)
+        assert rlm(q="x", interpreter_factory=mounted).a == "from mount"
+
+
+def test_rlm_uses_configured_interpreter_factory_and_its_instructions():
+    """dspy.configure/context(interpreter_factory=...) selects Monty for a
+    plain dspy.RLM() and RLM picks up Monty's execution_instructions."""
+    import dspy
+
+    lm = _dummy_lm([("go", "SUBMIT(a='hi')")])
+    with dspy.context(lm=lm, interpreter_factory=MontyInterpreter.factory(request_timeout=5.0)):
+        rlm = dspy.RLM("q -> a", max_iters=2)
+        assert "match statements are NOT supported" in rlm.generate_action.signature.instructions
+        assert rlm(q="x").a == "hi"
+
+
+def test_rlm_acall_awaits_async_tool_through_monty():
+    import asyncio
+
+    import dspy
+
+    lm = _dummy_lm([("call", "y = double(2)\nprint(y)"), ("done", "SUBMIT(a=str(y))")])
+    double = dspy.Tool(_double_async, name="double")
+
+    async def main():
+        with dspy.context(lm=lm):
+            rlm = dspy.RLM("q -> a", tools=[double], interpreter_factory=MontyInterpreter, max_iters=3)
+            return await rlm.acall(q="x")
+
+    result = asyncio.run(main())
+    assert result.a == "4"
+    assert result.trajectory[0]["output"] == "4"
+
+
+def test_rlm_sandbox_serializable_inputs_are_injected():
+    """dspy >= 3.4 injects SandboxSerializable inputs via start() + execute()
+    with text or base64 payloads before the first iteration."""
+    import dspy
+    from dspy.primitives.sandbox_serializable import SandboxSerializable
+
+    class Doc(SandboxSerializable):
+        def __init__(self, text):
+            self.text = text
+
+        def sandbox_setup(self):
+            return "import json"
+
+        def to_sandbox(self):
+            return self.text.encode()
+
+        def sandbox_assignment(self, name, raw):
+            return f"{name} = {raw}.upper()"
+
+        def rlm_preview(self, max_chars=500):
+            return "a doc"
+
+    class Blob(SandboxSerializable):
+        def sandbox_setup(self):
+            return ""
+
+        def to_sandbox(self):
+            return bytes([0xFF, 0x00, 0x41])  # not valid UTF-8 -> base64 path
+
+        def sandbox_assignment(self, name, raw):
+            return f"{name} = len({raw})"
+
+        def rlm_preview(self, max_chars=500):
+            return "blob"
+
+    lm = _dummy_lm([("go", "SUBMIT(a=doc + str(blob))")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("doc, blob -> a", interpreter_factory=MontyInterpreter, max_iters=2)
+        assert rlm(doc=Doc("hello"), blob=Blob()).a == "HELLO3"
 
 
 def test_rlm_feeds_runtime_errors_back_to_the_lm():

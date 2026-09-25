@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Interpreters",
 ]
 dependencies = [
-    "dspy>=3.3.1",
+    "dspy>=3.4.0",
     "pydantic-monty>=1.0.0",
 ]
 

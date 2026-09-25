@@ -94,25 +94,47 @@ def test_rlm_with_custom_tool():
     )
 
 
-def test_rlm_parallel_forwards_share_one_interpreter():
-    """One MontyInterpreter instance serving concurrent RLM forwards
-    (the dspy.Evaluate / dspy.Parallel pattern) returns correct,
+def test_rlm_parallel_forwards():
+    """Concurrent RLM forwards (the dspy.Evaluate / dspy.Parallel pattern)
+    each get their own interpreter from the factory and return correct,
     non-interfering results."""
     from concurrent.futures import ThreadPoolExecutor
 
     dspy.configure(lm=_select_lm())
 
-    interpreter = MontyInterpreter()
     rlm = dspy.RLM(
         "numbers: list[int] -> total: int",
-        interpreter_factory=MontyInterpreter,
+        interpreter_factory=MontyInterpreter.factory(request_timeout=30.0),
         max_iters=5,
         max_llm_calls=3,
     )
 
     inputs = [[1, 2, 3], [10, 20], [100, 200, 300]]
     with ThreadPoolExecutor(max_workers=3) as ex:
-        results = list(ex.map(lambda nums: rlm(interpreter, numbers=nums), inputs))
+        results = list(ex.map(lambda nums: rlm(numbers=nums), inputs))
 
     assert [int(r.total) for r in results] == [6, 30, 600]
-    interpreter.shutdown()
+
+
+def test_rlm_awaits_async_tool_via_acall():
+    """An async tool is awaited by MontyInterpreter, including under
+    RLM.acall() where execute() runs inside a running event loop."""
+    import asyncio
+
+    dspy.configure(lm=_select_lm())
+
+    async def lookup_city_population(city: str) -> str:
+        """Return population of a city. Tiny stub database."""
+        await asyncio.sleep(0)
+        return {"paris": "2161000"}.get(city.lower(), "0")
+
+    rlm = dspy.RLM(
+        "city: str -> population: int",
+        interpreter_factory=MontyInterpreter,
+        tools=[lookup_city_population],
+        max_iters=5,
+        max_llm_calls=3,
+    )
+
+    result = asyncio.run(rlm.acall(city="Paris"))
+    assert int(result.population) == 2161000
