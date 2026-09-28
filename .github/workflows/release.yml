@@ -1,0 +1,58 @@
+name: Release
+
+# Publishes to PyPI when a GitHub Release is published. Cut one with:
+#   gh release create vX.Y.Z --generate-notes
+# The tag must match `version` in pyproject.toml. See RELEASING.md.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check tag matches pyproject version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv version --short)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::release tag v$tag does not match pyproject.toml version $version"
+            exit 1
+          fi
+      - name: Build
+        run: uv build
+      - name: Smoke-test the wheel
+        run: |
+          uv venv --python 3.12 /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/python -c "from dspy_monty_interpreter import MontyInterpreter; i = MontyInterpreter(); assert i.execute('1 + 1') == '2'; i.shutdown(); print('ok')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dspy-monty-interpreter/${{ github.ref_name }}
+    permissions:
+      id-token: write   # PyPI trusted publishing (OIDC); no API token needed
+      contents: write   # attach dist files to the GitHub Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attach dist files to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
