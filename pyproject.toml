@@ -17,11 +17,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Interpreters",
 ]
 dependencies = [
-    "dspy>=3.3.1",
-    "pydantic-monty>=0.0.23",
+    "dspy>=3.4.0",
+    "pydantic-monty>=1.0.0",
 ]
 
 [project.optional-dependencies]

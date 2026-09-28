@@ -85,27 +85,24 @@ def run_tool(model: str) -> bool:
 
 
 def run_error_recovery(model: str) -> bool:
-    """Caller-owned interpreter reused across calls; a task that tends to
-    provoke a runtime error first (unknown key), so RLM must recover from a
-    CodeExecutionError correction turn rather than aborting."""
-    print("\n3. caller-owned interpreter + error recovery")
-    interpreter = MontyInterpreter(request_timeout=30.0)
+    """Configured factory (request_timeout) across two calls; a task that
+    tends to provoke a runtime error first (unknown key), so RLM must recover
+    from a CodeExecutionError correction turn rather than aborting."""
+    print("\n3. configured factory + error recovery")
     rlm = dspy.RLM(
         "records: dict, key: str -> value: str",
+        interpreter_factory=MontyInterpreter.factory(request_timeout=30.0),
         max_iters=6,
         max_llm_calls=3,
     )
-    try:
-        records = {"alpha": "1", "beta": "2"}
-        r1 = rlm(interpreter, records=records, key="beta")
-        ok = check("value(beta)", r1.value == "2", f"got {r1.value!r}, want '2'")
-        r2 = rlm(interpreter, records=records, key="gamma")
-        # Any non-crashing answer is fine; the point is forward() completed
-        # after the sandbox raised a KeyError or similar along the way.
-        ok &= check("value(gamma) completed", isinstance(r2.value, str), f"got {r2.value!r}")
-        return ok
-    finally:
-        interpreter.shutdown()
+    records = {"alpha": "1", "beta": "2"}
+    r1 = rlm(records=records, key="beta")
+    ok = check("value(beta)", r1.value == "2", f"got {r1.value!r}, want '2'")
+    r2 = rlm(records=records, key="gamma")
+    # Any non-crashing answer is fine; the point is forward() completed
+    # after the sandbox raised a KeyError or similar along the way.
+    ok &= check("value(gamma) completed", isinstance(r2.value, str), f"got {r2.value!r}")
+    return ok
 
 
 def main() -> int:

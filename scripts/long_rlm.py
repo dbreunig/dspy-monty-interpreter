@@ -137,19 +137,14 @@ def main() -> int:
 
     from pydantic_monty import ResourceLimits
 
-    interpreter = MontyInterpreter(
+    factory = MontyInterpreter.factory(
         request_timeout=60.0,
         resource_limits=ResourceLimits(max_memory=2 * 1024**3),
     )
-    # interpreter_factory is still needed even though the interpreter is passed
-    # positionally: RLM reads execution_instructions off the factory.
-    rlm = dspy.RLM(Forensics, interpreter_factory=MontyInterpreter, max_iters=args.max_iters, max_llm_calls=5, verbose=args.verbose)
+    rlm = dspy.RLM(Forensics, interpreter_factory=factory, max_iters=args.max_iters, max_llm_calls=5, verbose=args.verbose)
 
     started = time.perf_counter()
-    try:
-        pred = rlm(interpreter, orders_jsonl=text)
-    finally:
-        interpreter.shutdown()
+    pred = rlm(orders_jsonl=text)
     elapsed = time.perf_counter() - started
 
     steps = pred.trajectory

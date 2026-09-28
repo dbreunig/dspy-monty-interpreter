@@ -879,6 +879,11 @@ def test_execution_instructions_describe_monty_limitations():
     # Monty cannot pass builtin methods as values (max(d, key=d.get) fails).
     assert "key=d.get" in text
     assert "decimal" in text
+    # Monty 1.0 additions and long-standing syntax gaps.
+    for mod in ("random", "time", "copy", "pathlib"):
+        assert f" {mod}," in text or f" {mod}." in text
+    assert "yield" in text
+    assert "inheritance" in text
 
 
 # --- pydantic-monty 0.0.18 regressions ---
@@ -1053,6 +1058,49 @@ def test_max_memory_limit_raises_and_keeps_state():
         interp.shutdown()
 
 
+def test_feed_time_limit_resets_session():
+    """max_feed_duration_secs surfaces as a recoverable CodeExecutionError,
+    but Monty makes no guarantees about the heap afterwards, so the session
+    is discarded: the next execute() starts with empty state."""
+    from dspy.primitives.code_interpreter import CodeExecutionError
+    from pydantic_monty import ResourceLimits
+
+    interp = MontyInterpreter(resource_limits=ResourceLimits(max_feed_duration_secs=0.2))
+    interp.execute("x = 42")
+    with pytest.raises(CodeExecutionError, match="time limit exceeded.*variables were lost"):
+        interp.execute("i = 0\nwhile True:\n    i += 1")
+    with pytest.raises(CodeExecutionError, match="NameError"):
+        interp.execute("x")
+    assert interp.execute("1 + 1") == "2"
+    interp.shutdown()
+
+
+def test_turn_time_limit_resets_session():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+    from pydantic_monty import ResourceLimits
+
+    interp = MontyInterpreter(resource_limits=ResourceLimits(max_turn_duration_secs=0.2))
+    interp.execute("x = 42")
+    with pytest.raises(CodeExecutionError, match="turn time limit exceeded"):
+        interp.execute("while True:\n    pass")
+    with pytest.raises(CodeExecutionError, match="NameError"):
+        interp.execute("x")
+    interp.shutdown()
+
+
+def test_user_raised_timeout_error_keeps_state():
+    """Only Monty's own limit TimeoutError resets the session; code raising
+    TimeoutError itself is an ordinary runtime error."""
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    interp = MontyInterpreter()
+    interp.execute("x = 42")
+    with pytest.raises(CodeExecutionError, match="TimeoutError: mine"):
+        interp.execute("raise TimeoutError('mine')")
+    assert interp.execute("x") == "42"
+    interp.shutdown()
+
+
 def test_worker_crash_raises_and_recovers():
     """A crashed worker (here: exceeding request_timeout) surfaces as
     CodeInterpreterError, and the interpreter recovers with a fresh
@@ -1078,6 +1126,151 @@ def test_external_function_identity():
     assert interp.execute("print(SUBMIT is SUBMIT)") == "True"
 
 
+# --- Async tools (dspy >= 3.4 wraps coroutine tools as async def) ---
+
+
+async def _double_async(x: int) -> int:
+    """Async tool stub."""
+    import asyncio
+
+    await asyncio.sleep(0)
+    return x * 2
+
+
+def test_async_tool_result_is_awaited():
+    interp = MontyInterpreter(tools={"double": _double_async})
+    assert interp.execute("double(21)") == "42"
+    interp.shutdown()
+
+
+def test_async_tool_awaited_inside_running_event_loop():
+    """RLM.aforward() still calls execute() synchronously from inside the
+    event loop; the coroutine must run on a helper loop, not deadlock."""
+    import asyncio
+
+    async def main() -> str:
+        interp = MontyInterpreter(tools={"double": _double_async})
+        try:
+            return interp.execute("double(4)")
+        finally:
+            interp.shutdown()
+
+    assert asyncio.run(main()) == "8"
+
+
+def test_async_tool_error_is_code_execution_error():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    async def boom() -> str:
+        raise ValueError("async boom")
+
+    interp = MontyInterpreter(tools={"boom": boom})
+    with pytest.raises(CodeExecutionError, match="async boom"):
+        interp.execute("boom()")
+    interp.shutdown()
+
+
+def test_async_tool_fires_tool_call_callbacks_with_awaited_result():
+    import dspy
+    from dspy.utils.callback import BaseCallback
+
+    seen: list[tuple[str, object]] = []
+
+    class Cb(BaseCallback):
+        def on_interpreter_tool_call_end(self, call_id, outputs, exception=None):
+            seen.append(("end", outputs))
+
+    interp = MontyInterpreter(tools={"double": _double_async}, callbacks=[Cb()])
+    with dspy.context(callbacks=[]):
+        interp.execute("double(5)")
+    interp.shutdown()
+    assert seen == [("end", 10)]
+
+
+# --- Monty 1.0 stdlib and os_policy ---
+
+
+def test_monty_1_0_stdlib_modules_import():
+    interp = MontyInterpreter()
+    assert interp.execute(
+        "import random, time, copy, pathlib, binascii\n"
+        "random.seed(1)\n"
+        "isinstance(time.time(), float) and copy.deepcopy([1])[0]"
+    ) == "1"
+    interp.shutdown()
+
+
+def test_datetime_now_works_without_os_access():
+    interp = MontyInterpreter()
+    assert interp.execute("import datetime\ndatetime.datetime.now().year >= 2026") == "True"
+    interp.shutdown()
+
+
+def test_sleep_returns_immediately_by_default():
+    import time
+
+    interp = MontyInterpreter()
+    start = time.monotonic()
+    assert interp.execute("import time\ntime.sleep(5)\n'ok'") == "ok"
+    assert time.monotonic() - start < 1.0
+    interp.shutdown()
+
+
+def test_os_policy_can_restore_system_sleep():
+    import time
+
+    interp = MontyInterpreter(os_policy={"sleep": "system"})
+    start = time.monotonic()
+    interp.execute("import time\ntime.sleep(0.3)")
+    assert time.monotonic() - start >= 0.3
+    interp.shutdown()
+
+
+def test_os_policy_freezes_clock_and_seeds_random():
+    from datetime import datetime
+
+    interp = MontyInterpreter(
+        os_policy={"datetime": datetime(2020, 2, 3, 4, 5), "random_start": {"seed": 7}}
+    )
+    assert interp.execute("import datetime\nstr(datetime.datetime.now())") == "2020-02-03 04:05:00"
+    first = interp.execute("import random\nrandom.random()")
+    interp.shutdown()
+    interp = MontyInterpreter(os_policy={"random_start": {"seed": 7}})
+    assert interp.execute("import random\nrandom.random()") == first
+    interp.shutdown()
+
+
+def test_os_policy_merges_with_default_sleep_zero():
+    interp = MontyInterpreter(os_policy={"timezone": "utc"})
+    assert interp._os_policy == {"sleep": "zero", "timezone": "utc"}
+    assert MontyInterpreter(os_policy={"sleep": "system"})._os_policy == {"sleep": "system"}
+
+
+def test_os_access_clock_override_needs_call_host():
+    """Since Monty 1.0 an AbstractOS clock override is consulted only when
+    os_policy routes the clock to the host."""
+    from datetime import datetime
+
+    from pydantic_monty import OSAccess
+
+    class Frozen(OSAccess):
+        def datetime_now(self, tz=None):
+            return datetime(1999, 1, 1)
+
+    code = "import datetime\ndatetime.datetime.now().year"
+    interp = MontyInterpreter(os_access=Frozen())
+    assert interp.execute(code) != "1999"
+    interp.shutdown()
+    interp = MontyInterpreter(os_access=Frozen(), os_policy={"datetime": "call_host"})
+    assert interp.execute(code) == "1999"
+    interp.shutdown()
+
+
+def test_factory_passes_os_policy():
+    factory = MontyInterpreter.factory(os_policy={"sleep": "system"})
+    assert factory()._os_policy == {"sleep": "system"}
+
+
 # --- RLM integration (no LM needed) ---
 
 
@@ -1087,6 +1280,119 @@ def test_rlm_accepts_class_as_interpreter_factory():
     assert isinstance(MontyInterpreter(), dspy.CodeInterpreter)
     rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter)
     assert "match statements are NOT supported" in rlm.generate_action.signature.instructions
+
+
+def _dummy_lm(steps: list[tuple[str, str]]):
+    from dspy.utils.dummies import DummyLM
+
+    return DummyLM([{"reasoning": r, "code": c} for r, c in steps])
+
+
+def test_rlm_forward_runs_tool_and_typed_submit_through_monty():
+    """Full RLM loop on dspy >= 3.4 with a scripted LM: tool call, print
+    output fed back, typed SUBMIT parsed into the output field."""
+    import dspy
+
+    calls: list[str] = []
+
+    def lookup(city: str) -> str:
+        """Population lookup."""
+        calls.append(city)
+        return "2161000"
+
+    lm = _dummy_lm([("look", "pop = lookup('Paris')\nprint(pop)"), ("done", "SUBMIT(population=int(pop))")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("city -> population: int", tools=[lookup], interpreter_factory=MontyInterpreter, max_iters=3)
+        result = rlm(city="Paris")
+    assert result.population == 2161000
+    assert calls == ["Paris"]
+    assert result.trajectory[0]["output"] == "2161000"
+
+
+def test_rlm_call_time_interpreter_factory_override(tmp_path):
+    """dspy >= 3.4: interpreter_factory= at call time overrides the module's
+    factory for that call only, prompt instructions included."""
+    import dspy
+
+    (tmp_path / "note.txt").write_text("from mount")
+    mounted = MontyInterpreter.factory(
+        mounts=MountDir(virtual_path="/data", host_path=str(tmp_path), mode="read-only")
+    )
+    lm = _dummy_lm([("read", "SUBMIT(a=open('/data/note.txt').read())")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter, max_iters=2)
+        assert rlm(q="x", interpreter_factory=mounted).a == "from mount"
+
+
+def test_rlm_uses_configured_interpreter_factory_and_its_instructions():
+    """dspy.configure/context(interpreter_factory=...) selects Monty for a
+    plain dspy.RLM() and RLM picks up Monty's execution_instructions."""
+    import dspy
+
+    lm = _dummy_lm([("go", "SUBMIT(a='hi')")])
+    with dspy.context(lm=lm, interpreter_factory=MontyInterpreter.factory(request_timeout=5.0)):
+        rlm = dspy.RLM("q -> a", max_iters=2)
+        assert "match statements are NOT supported" in rlm.generate_action.signature.instructions
+        assert rlm(q="x").a == "hi"
+
+
+def test_rlm_acall_awaits_async_tool_through_monty():
+    import asyncio
+
+    import dspy
+
+    lm = _dummy_lm([("call", "y = double(2)\nprint(y)"), ("done", "SUBMIT(a=str(y))")])
+    double = dspy.Tool(_double_async, name="double")
+
+    async def main():
+        with dspy.context(lm=lm):
+            rlm = dspy.RLM("q -> a", tools=[double], interpreter_factory=MontyInterpreter, max_iters=3)
+            return await rlm.acall(q="x")
+
+    result = asyncio.run(main())
+    assert result.a == "4"
+    assert result.trajectory[0]["output"] == "4"
+
+
+def test_rlm_sandbox_serializable_inputs_are_injected():
+    """dspy >= 3.4 injects SandboxSerializable inputs via start() + execute()
+    with text or base64 payloads before the first iteration."""
+    import dspy
+    from dspy.primitives.sandbox_serializable import SandboxSerializable
+
+    class Doc(SandboxSerializable):
+        def __init__(self, text):
+            self.text = text
+
+        def sandbox_setup(self):
+            return "import json"
+
+        def to_sandbox(self):
+            return self.text.encode()
+
+        def sandbox_assignment(self, name, raw):
+            return f"{name} = {raw}.upper()"
+
+        def rlm_preview(self, max_chars=500):
+            return "a doc"
+
+    class Blob(SandboxSerializable):
+        def sandbox_setup(self):
+            return ""
+
+        def to_sandbox(self):
+            return bytes([0xFF, 0x00, 0x41])  # not valid UTF-8 -> base64 path
+
+        def sandbox_assignment(self, name, raw):
+            return f"{name} = len({raw})"
+
+        def rlm_preview(self, max_chars=500):
+            return "blob"
+
+    lm = _dummy_lm([("go", "SUBMIT(a=doc + str(blob))")])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("doc, blob -> a", interpreter_factory=MontyInterpreter, max_iters=2)
+        assert rlm(doc=Doc("hello"), blob=Blob()).a == "HELLO3"
 
 
 def test_rlm_feeds_runtime_errors_back_to_the_lm():

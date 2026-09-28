@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import inspect
 import os
 import re
 import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Literal
 
 from dspy.primitives.code_interpreter import (
@@ -23,6 +26,7 @@ from pydantic_monty import (
     MontySession,
     MontySyntaxError,
     MountDir,
+    OSPolicy,
     ResourceLimits,
 )
 
@@ -46,13 +50,16 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "step are available in later steps. "
         "Nothing is pre-imported; write the import statements you need. "
         "Only these standard-library modules can be imported: re, json, math, datetime, "
-        "collections, itertools, functools, dataclasses, base64, typing, sys, os, asyncio, "
-        "unicodedata. "
-        "Other stdlib modules (decimal, statistics, csv, operator, ...) and all "
+        "time, random, collections, itertools, functools, dataclasses, copy, base64, "
+        "binascii, typing, sys, os, pathlib, asyncio, unicodedata. "
+        "Other stdlib modules (decimal, statistics, csv, operator, string, ...) and all "
         "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
-        "There is no network access, no subprocesses, and no environment variables. "
+        "There is no network access, no subprocesses, and no environment variables; "
+        "datetime.now() and time.time() do work. "
         "Supported syntax includes classes, decorators, @dataclass, comprehensions, "
-        "generators, with statements, and try/except; match statements are NOT supported. "
+        "generator expressions, lambdas, with statements, and try/except; match statements "
+        "are NOT supported, nor are generator functions (yield), class inheritance "
+        "(including subclassing Exception), or a callable replacement in re.sub(). "
         "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
         "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
         "max(d, key=lambda k: d[k]) or max(d.items(), key=lambda kv: kv[1]). "
@@ -63,6 +70,8 @@ _BASE_EXECUTION_INSTRUCTIONS = (
     )
 
 _NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted."
+
+_DEFAULT_OS_POLICY: OSPolicy = {"sleep": "zero"}
 
 _MOUNT_MODE_DESCRIPTIONS = {
     "read-only": "read-only",
@@ -197,42 +206,55 @@ class MontyInterpreter:
 
     Monty is a secure Python interpreter written in Rust. Unlike the default
     PythonInterpreter (Deno/Pyodide), Monty has no WASM bootstrap and provides
-    strict sandboxing with no network or environment access. As of Monty
-    0.0.19, code runs in a pool of ``monty`` worker subprocesses: a crashed
-    or timed-out worker is replaced transparently without taking down the
-    host process. Filesystem access can be enabled per-interpreter via the
-    ``mounts`` parameter.
+    strict sandboxing with no network or environment access. Code runs in a
+    pool of ``monty`` worker subprocesses: a crashed or timed-out worker is
+    replaced transparently without taking down the host process. Filesystem
+    access can be enabled per-interpreter via the ``mounts`` parameter.
 
     Pass ``resource_limits`` (a ``pydantic_monty.ResourceLimits`` dict) to
     cap each ``execute()`` call. ``max_memory`` (bytes) is enforced by
-    Monty's allocator as of 0.0.20, so a runaway allocation raises
-    ``MemoryError`` in the sandbox rather than on the host; it surfaces as
-    ``CodeExecutionError`` and the session keeps its state. Other keys:
-    ``max_duration_secs``, ``max_recursion_depth``, ``gc_interval``.
+    Monty's allocator, so a runaway allocation raises ``MemoryError`` in the
+    sandbox rather than on the host; it surfaces as ``CodeExecutionError``
+    and the session keeps its state. ``max_feed_duration_secs`` caps one
+    ``execute()`` call and ``max_turn_duration_secs`` caps the sandbox time
+    between host calls; Monty makes no guarantees about the heap after
+    either fires, so the adapter discards the session and the next
+    ``execute()`` starts with empty state. Other keys: ``max_recursion_depth``,
+    ``max_suspensions``, ``max_total_sleep_secs``, ``gc_interval``.
+
+    Pass ``os_policy`` (a ``pydantic_monty.OSPolicy`` dict) to control the
+    sandbox's clock, timezone, sleep, and random seed. The adapter defaults
+    ``sleep`` to ``'zero'`` so ``time.sleep()`` returns immediately instead
+    of holding a worker; pass ``{'sleep': 'system'}`` to restore real
+    waits. Clock overrides on an ``os_access`` object are only consulted
+    when ``os_policy`` selects ``'call_host'`` for ``datetime``.
 
     State persists across ``execute()`` calls via ``MontySession``, Monty's
     incremental REPL session — each snippet is compiled and run against
     the persistent heap and namespace without replaying prior snippets.
 
-    Sessions are per-thread: concurrent ``execute()`` calls from different
-    threads (e.g. ``dspy.Evaluate`` / ``dspy.Parallel`` running the same RLM
-    with ``num_threads``) each get their own isolated session, all sharing
-    one worker pool. RLM's per-forward reset discards only the calling
-    thread's session. For thread counts above your CPU count, pass
-    ``max_processes`` so the pool has one worker per thread.
-
-    Usage with RLM::
+    Usage with RLM (DSPy 3.4+)::
 
         # DSPy creates and shuts down one interpreter per forward():
         rlm = dspy.RLM("context -> answer", interpreter_factory=MontyInterpreter)
         result = rlm(context="...")
 
-        # Or pass a caller-owned interpreter positionally and reuse it:
-        interpreter = MontyInterpreter(request_timeout=10.0)
-        result = rlm(interpreter, context="...")
+        # Configure it through the factory, globally or per call:
+        dspy.configure(interpreter_factory=MontyInterpreter.factory(request_timeout=10.0))
+        result = rlm(context="...", interpreter_factory=MontyInterpreter.factory(mounts=[...]))
 
-    ``execution_instructions`` is read off the factory by RLM and added to
-    the action prompt, so the model knows Monty's stdlib and syntax limits.
+    Starting a worker pool costs a few milliseconds, so one interpreter per
+    ``forward()`` is the right default even under ``dspy.Evaluate``. If you
+    drive one instance from several threads yourself, each thread gets its
+    own isolated session on the shared pool; pass ``max_processes`` when
+    the thread count exceeds your CPU count.
+
+    Tools may be coroutine functions: ``invoke_tool`` awaits their result,
+    also when ``execute()`` runs inside an event loop (``RLM.acall``).
+
+    ``execution_instructions`` is read off the active factory by RLM on
+    every action call and added to the prompt, so the model knows Monty's
+    stdlib and syntax limits.
     With ``mounts`` it also describes each mounted directory: path, mode,
     and a bounded view of the top-level contents (names for small
     directories, counts and an extension histogram for large ones; see
@@ -256,6 +278,7 @@ class MontyInterpreter:
         max_processes: int | None = None,
         callbacks: list[BaseCallback] | None = None,
         mount_listing_limit: int = _MOUNT_LISTING_LIMIT,
+        os_policy: OSPolicy | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
@@ -263,6 +286,9 @@ class MontyInterpreter:
         self._resource_limits: ResourceLimits | None = resource_limits
         self._mounts: MountDir | list[MountDir] | None = mounts
         self._os_access: AbstractOS | None = os_access
+        # Sandbox code has nothing to wait for, so sleeping only holds a
+        # worker (Monty caps each system sleep at 10s); callers opt back in.
+        self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
         self._pool: Monty | None = None
@@ -316,7 +342,7 @@ class MontyInterpreter:
                     )
                     self._pool.__enter__()
                 pool = self._pool
-            session = pool.checkout(limits=self._resource_limits)
+            session = pool.checkout(limits=self._resource_limits, os_policy=self._os_policy)
             session.__enter__()
             local.session = session
             with self._lock:
@@ -349,7 +375,8 @@ class MontyInterpreter:
         """
         if tool_name not in self._tools:
             raise CodeInterpreterError(f"Unknown tool: {tool_name}")
-        return self._tools[tool_name](**kwargs)
+        result = self._tools[tool_name](**kwargs)
+        return _await_in_sync(result) if inspect.isawaitable(result) else result
 
     def _make_external_fn(self, tool_name: str) -> Callable[..., Any]:
         """Build the callable Monty invokes for ``tool_name``.
@@ -463,7 +490,14 @@ class MontyInterpreter:
                 self._has_state = True
                 args, kwargs = submit_box[0]
                 return _handle_submit(args, kwargs, self.output_fields)
-            raise CodeExecutionError(e.display("type-msg")) from e
+            message = e.display("type-msg")
+            if _is_time_limit(e):
+                # A feed or turn time limit stops the sandbox mid-operation
+                # and Monty makes no guarantees about its heap afterwards:
+                # discard the session so the next execute() starts clean.
+                self._discard_session()
+                message += "; the sandbox was reset and all variables were lost"
+            raise CodeExecutionError(message) from e
 
         self._has_state = True
 
@@ -526,6 +560,33 @@ def _handle_submit(
     if len(args) == 0:
         return FinalOutput(None)
     return FinalOutput(args[0])
+
+
+def _await_in_sync(awaitable: Any) -> Any:
+    """Run an awaitable to completion from synchronous code.
+
+    RLM wraps coroutine tools as ``async def`` and calls ``execute()``
+    synchronously even from ``aforward()``, so a loop may already be running
+    in this thread; then the awaitable runs on its own loop in a helper
+    thread, as DSPy's ``LocalInterpreter`` does.
+    """
+
+    async def run() -> Any:
+        return await awaitable
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run())
+    ctx = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(ctx.run, asyncio.run, run()).result()
+
+
+def _is_time_limit(e: MontyRuntimeError) -> bool:
+    """True when ``max_feed_duration_secs`` or ``max_turn_duration_secs``
+    stopped the sandbox, as opposed to code raising ``TimeoutError`` itself."""
+    return isinstance(e.exception(), TimeoutError) and "time limit exceeded" in e.display("msg")
 
 
 def _strip_code_fences(code: str) -> str:

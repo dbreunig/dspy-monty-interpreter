@@ -15,14 +15,15 @@ Single class: `MontyInterpreter` in `src/dspy_monty_interpreter/interpreter.py`.
 
 Key Monty surface area it consumes (from `pydantic_monty`):
 
-- `Monty` — subprocess worker pool, created lazily in `_ensure_session()` (entered manually, not via `with`), closed on `shutdown()`. `request_timeout` is passed through from the adapter constructor.
-- `MontySession` — persistent incremental REPL session from `pool.checkout(limits=…)`. Discarded (returned to pool) on `shutdown()`, on `MontyCrashedError`, and whenever RLM resets `_tools_registered = False`.
-- `MontySession.feed_run(code, inputs=, external_lookup=, print_callback=, mount=, os=)` — the one execution call. Any signature change here is a breaking change. (`skip_type_check=` also exists but adapter does not use it. `external_lookup` was named `external_functions` before 0.0.19.)
-- `MontyRuntimeError`, `MontySyntaxError` — caught and re-raised as DSPy `CodeInterpreterError` / Python `SyntaxError`.
+- `Monty` — subprocess worker pool, created lazily in `_ensure_session()` (entered manually, not via `with`), closed on `shutdown()`. `request_timeout` and `max_processes` are passed through from the adapter constructor.
+- `MontySession` — persistent incremental REPL session from `pool.checkout(limits=…, os_policy=…)`. Discarded (returned to pool) on `shutdown()`, on `MontyCrashedError`, on a feed/turn time-limit `TimeoutError`, and whenever RLM resets `_tools_registered = False`.
+- `MontySession.feed_run(code, inputs=, external_lookup=, print_callback=, mount=, os=)` — the one execution call. Any signature change here is a breaking change. (`skip_type_check=` and `cwd=` (1.0) also exist but the adapter does not use them. `external_lookup` was named `external_functions` before 0.0.19.)
+- `MontyRuntimeError`, `MontySyntaxError` — caught and re-raised as DSPy `CodeExecutionError` / Python `SyntaxError`. `_is_time_limit()` inspects `e.exception()` and `e.display("msg")` to spot Monty's feed/turn limit `TimeoutError` (message contains "time limit exceeded"); a change to that message or type silently disables the session reset.
+- `OSPolicy` — passed through as `os_policy` constructor arg (merged over the adapter default `{"sleep": "zero"}`), forwarded to `checkout(os_policy=…)`. New in 1.0; before 1.0 `AbstractOS` clock overrides fired unconditionally, since 1.0 only under `datetime: 'call_host'`.
 - `MontyCrashedError` — worker died or hit `request_timeout`; adapter discards the session (state is lost) and re-raises as `CodeInterpreterError`.
 - `MountDir` — passed through as `mounts` constructor arg. Keyword-only since 0.0.19 (`host_path=`, `virtual_path=`, `mode=`). Overlay writes are per-feed since 0.0.19 — discarded when each `feed_run` ends.
 - `AbstractOS` — passed through as `os_access` constructor arg, forwarded to `feed_run(os=…)`. `OSAccess` is the concrete subclass users most often instantiate.
-- `ResourceLimits` — passed through as `resource_limits` constructor arg, forwarded to `checkout(limits=…)`. A TypedDict since 0.0.19.
+- `ResourceLimits` — passed through as `resource_limits` constructor arg, forwarded to `checkout(limits=…)`. A TypedDict since 0.0.19. 1.0 replaced `max_duration_secs` with `max_feed_duration_secs` + `max_turn_duration_secs` and added `max_total_sleep_secs`; the README's key list must track this.
 
 Adapter responsibilities Monty does NOT provide:
 
@@ -34,9 +35,9 @@ Adapter responsibilities Monty does NOT provide:
 Project goals (informs the recommendation):
 
 - Stay a **thin** adapter — push capability into Monty, keep wrapping minimal.
-- Track real Monty capability: as Monty grows (more stdlib, match stmts) update README's "limitations" list. (Classes work as of 0.0.19.)
-- Maintain compatibility with `dspy>=3.0`'s `CodeInterpreter` protocol.
-- Currently pinned: `pydantic-monty>=0.0.19` in `pyproject.toml`.
+- Track real Monty capability: as Monty grows (more stdlib, match stmts) update README's "limitations" list AND `_BASE_EXECUTION_INSTRUCTIONS` in `interpreter.py`. (Classes work as of 0.0.19; still missing as of 1.0: `match`, `yield`, class inheritance, callable `re.sub` replacement.) Verify by installing the new version and running `import <mod>` / syntax probes through `MontyInterpreter().execute()` rather than trusting release notes.
+- Maintain compatibility with `dspy>=3.4`'s `CodeInterpreter` protocol and RLM contract: one interpreter per `forward()` created from `interpreter_factory` (module arg, `dspy.configure`, or call-time kwarg), always shut down by RLM; coroutine tools are wrapped as `async def` and must be awaited in `invoke_tool`.
+- Currently pinned: `pydantic-monty>=1.0.0` in `pyproject.toml` (1.0 split the wheel into `pydantic-monty-client` + `pydantic-monty-runtime`; the metapackage pin still works).
 
 ## Workflow
 
