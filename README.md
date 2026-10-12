@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`) and can't yet use match statements, generator functions (`yield`), or class inheritance. It does support classes, decorators, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`) and can't yet use match statements, generator functions (`yield`), or class inheritance. It does support classes, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -12,7 +12,7 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `dspy>=3.4.0` and `pydantic-monty>=1.0.0`. Since 1.0, `pydantic-monty` is a metapackage that installs `pydantic-monty-client` (the Python bindings) and `pydantic-monty-runtime` (the `monty` worker binary). If the binary comes from somewhere else, such as a base image, install `pydantic-monty-client` alone and point it at the binary with the `MONTY_BIN` environment variable.
+Requires `dspy>=3.4.0` and `pydantic-monty>=1.1.0`. Since 1.0, `pydantic-monty` is a metapackage that installs `pydantic-monty-client` (the Python bindings) and `pydantic-monty-runtime` (the `monty` worker binary). If the binary comes from somewhere else, such as a base image, install `pydantic-monty-client` alone and point it at the binary with the `MONTY_BIN` environment variable.
 
 ## Usage
 

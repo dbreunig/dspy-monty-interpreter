@@ -56,7 +56,7 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
         "There is no network access, no subprocesses, and no environment variables; "
         "datetime.now() and time.time() do work. "
-        "Supported syntax includes classes, decorators, @dataclass, comprehensions, "
+        "Supported syntax includes classes, decorators, @dataclass, complex numbers, comprehensions, "
         "generator expressions, lambdas, with statements, and try/except; match statements "
         "are NOT supported, nor are generator functions (yield), class inheritance "
         "(including subclassing Exception), or a callable replacement in re.sub(). "
