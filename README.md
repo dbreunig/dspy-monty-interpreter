@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`) and can't yet use match statements, generator functions (`yield`), or class inheritance. It does support classes, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -83,7 +83,7 @@ The model can read every file under `./reports` through `/data`, and it can writ
 Because the factory knows about the mounts, its `execution_instructions` tell the model what is there. For the example above the prompt gains a section like:
 
 ```
-Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir(), and open(path); os.path and os.walk are not available):
+Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir(), os.walk(path), and open(path)):
 - /data (read-only) containing q3/, readme.md
 - /scratch (overlay: writable, but writes are discarded when each execution ends) containing (empty)
 ```
@@ -113,6 +113,48 @@ interp.execute(
 Two things to know about overlays. First, an overlay only lives for the duration of a single `execute()` call. Code that writes a file must read it back in the same call. Use `read-write` mode when files need to survive across calls. Second, overlay writes never reach the host, so the only way to get overlay data out is from inside the sandbox. Have the code `print()` or `SUBMIT()` the results, or use `read-write` mode when you need real files on disk.
 
 For a fully virtual filesystem or environment variables, pass an `AbstractOS` implementation (such as `pydantic_monty.OSAccess`) as the `os_access` parameter. See the [Monty documentation](https://github.com/pydantic/monty) for details. To control the clock, see [Clock, sleep, and randomness](#clock-sleep-and-randomness).
+
+## Host modules
+
+Pass `external_modules` to let sandbox code `import` modules you build on the host. Each entry maps a module name to a `pydantic_monty.ExternalModule`, or to a zero-argument function that returns one (called once per session, the first time the code imports it):
+
+```python
+import dspy
+from dspy_monty_interpreter import ClassInstance, ExternalModule, MontyInterpreter
+
+
+class Classifier:
+    def __init__(self, labels: list[str]):
+        self.labels = labels
+        self._predict = dspy.Predict("text, labels: list[str] -> label: str")
+
+    def classify(self, text: str) -> str:
+        return self._predict(text=text, labels=self.labels).label
+
+
+def classifier(labels: list[str]):
+    return ClassInstance(Classifier(labels), eager_attrs={"labels"}, allowed_methods={"classify"})
+
+
+def summarize(text: str) -> str:
+    return dspy.Predict("text -> summary")(text=text).summary
+
+
+helpers = ExternalModule({"summarize": summarize, "classifier": classifier})
+rlm = dspy.RLM(
+    "documents -> report",
+    interpreter_factory=MontyInterpreter.factory(external_modules={"helpers": helpers}),
+)
+```
+
+The sandbox code can then run `from helpers import summarize` or `c = helpers.classifier(["bug", "feature"])` followed by `c.classify(text)`. A few rules:
+
+- Functions in a module run on the host, outside the sandbox. They can return plain data (strings, numbers, lists, dicts, dataclasses). Wrap any other object in `ClassInstance` and list the methods the sandbox may call. A wrapped object can't be called directly, so expose a method such as `classify()` in place of `__call__`.
+- Monty can't take a Python module as is: `external_modules={"dspy": dspy}` fails. Build an `ExternalModule` with exactly the functions you want to expose.
+- Keys starting with `_` are hidden from the sandbox. Nested `ExternalModule`s become submodules (`import helpers.text`).
+- Calls into a module don't fire DSPy's tool callbacks. Use `tools` when you need them traced.
+
+The sandbox has no `dir()` or `help()`, so the model learns a module's API from the prompt. `execution_instructions` lists each module's public attributes and function signatures, or shows its stubs when you pass `ExternalModule(attrs, stubs="def summarize(text: str) -> str: ...")`. Stubs over 4,000 characters are truncated. A module given as a factory is listed by name only, so the factory isn't called before the code needs it.
 
 ## Clock, sleep, and randomness
 

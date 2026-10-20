@@ -9,6 +9,7 @@ import os
 import re
 import threading
 from collections import Counter
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Literal
 
@@ -20,6 +21,7 @@ from dspy.primitives.code_interpreter import (
 from dspy.utils.callback import BaseCallback, with_callbacks
 from pydantic_monty import (
     AbstractOS,
+    ExternalModule,
     Monty,
     MontyCrashedError,
     MontyRuntimeError,
@@ -51,14 +53,15 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "Nothing is pre-imported; write the import statements you need. "
         "Only these standard-library modules can be imported: re, json, math, datetime, "
         "time, random, collections, itertools, functools, dataclasses, copy, base64, "
-        "binascii, typing, sys, os, pathlib, asyncio, unicodedata. "
-        "Other stdlib modules (decimal, statistics, csv, operator, string, ...) and all "
+        "binascii, typing, sys, os, os.path, pathlib, asyncio, unicodedata, csv, tomllib, "
+        "hashlib, bisect. "
+        "Other stdlib modules (decimal, statistics, io, operator, string, heapq, enum, ...) and all "
         "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
         "There is no network access, no subprocesses, and no environment variables; "
         "datetime.now() and time.time() do work. "
         "Supported syntax includes classes, decorators, @dataclass, complex numbers, comprehensions, "
-        "generator expressions, lambdas, with statements, and try/except; match statements "
-        "are NOT supported, nor are generator functions (yield), class inheritance "
+        "generator expressions, lambdas, with statements, try/except, and match statements; "
+        "generator functions (yield) are NOT supported, nor are class inheritance "
         "(including subclassing Exception), or a callable replacement in re.sub(). "
         "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
         "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
@@ -94,7 +97,7 @@ def _describe_mounts(mounts: MountDir | list[MountDir] | None, listing_limit: in
     if not mount_list:
         return _NO_FILESYSTEM_INSTRUCTIONS
     lines = ["Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir(), "
-             "and open(path); os.path and os.walk are not available):"]
+             "os.walk(path), and open(path)):"]
     for m in mount_list:
         mode = _MOUNT_MODE_DESCRIPTIONS.get(m.mode, m.mode)
         line = f"- {m.virtual_path} ({mode})"
@@ -175,10 +178,64 @@ def _summarize_entries(entries: list[os.DirEntry], truncated: bool) -> str:
     return text if len(text) <= _MOUNT_LINE_BUDGET else text[: _MOUNT_LINE_BUDGET - 1] + "…"
 
 
+_MODULE_STUB_BUDGET = 4_000  # characters of one host module's stubs in the prompt
+
+
+def _describe_external_modules(modules: Mapping[str, Any] | None) -> str:
+    """Section naming the host modules sandbox code may import.
+
+    The sandbox has no dir(), help() or __doc__, so the model learns a
+    module's API only from here: its ``.pyi`` stubs when given, otherwise
+    its public attribute names and function signatures. A factory is named
+    but not called, so the module is still built lazily.
+    """
+    if not modules:
+        return ""
+    lines = [
+        (
+            "Host modules you can import (dir() and help() are unavailable; "
+            "rely on these descriptions):"
+        )
+    ]
+    for name, module in modules.items():
+        if not isinstance(module, ExternalModule):
+            lines.append(f"- {name}")
+        elif module.stubs:
+            stubs = module.stubs.strip()
+            if len(stubs) > _MODULE_STUB_BUDGET:
+                stubs = stubs[:_MODULE_STUB_BUDGET] + "\n# ... (truncated)"
+            lines.append(f"- {name}:\n```python\n{stubs}\n```")
+        else:
+            lines.append(f"- {name}: {_describe_module_attrs(module)}")
+    return "\n".join(lines)
+
+
+def _describe_module_attrs(module: ExternalModule) -> str:
+    parts: list[str] = []
+    for key, value in module.attrs.items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, ExternalModule):
+            parts.append(f"{key} (submodule)")
+        elif callable(value):
+            try:
+                parts.append(f"{key}{inspect.signature(value)}")
+            except (TypeError, ValueError):
+                parts.append(f"{key}(...)")
+        else:
+            parts.append(key)
+    return ", ".join(parts) or "(no public attributes)"
+
+
 def _build_execution_instructions(
-    mounts: MountDir | list[MountDir] | None, listing_limit: int = _MOUNT_LISTING_LIMIT
+    mounts: MountDir | list[MountDir] | None,
+    listing_limit: int = _MOUNT_LISTING_LIMIT,
+    external_modules: Mapping[str, Any] | None = None,
 ) -> str:
-    return _BASE_EXECUTION_INSTRUCTIONS + "\n" + _describe_mounts(mounts, listing_limit)
+    sections = [_BASE_EXECUTION_INSTRUCTIONS, _describe_mounts(mounts, listing_limit)]
+    if modules_text := _describe_external_modules(external_modules):
+        sections.append(modules_text)
+    return "\n".join(sections)
 
 
 class _MontyFactory:
@@ -191,7 +248,9 @@ class _MontyFactory:
     def __init__(self, kwargs: dict[str, Any]) -> None:
         self._kwargs = kwargs
         self.execution_instructions = _build_execution_instructions(
-            kwargs.get("mounts"), kwargs.get("mount_listing_limit", _MOUNT_LISTING_LIMIT)
+            kwargs.get("mounts"),
+            kwargs.get("mount_listing_limit", _MOUNT_LISTING_LIMIT),
+            kwargs.get("external_modules"),
         )
 
     def __call__(self) -> MontyInterpreter:
@@ -228,6 +287,14 @@ class MontyInterpreter:
     of holding a worker; pass ``{'sleep': 'system'}`` to restore real
     waits. Clock overrides on an ``os_access`` object are only consulted
     when ``os_policy`` selects ``'call_host'`` for ``datetime``.
+
+    Pass ``external_modules`` (a mapping of name to
+    ``pydantic_monty.ExternalModule``, or to a zero-argument factory that
+    returns one) to let sandbox code ``import`` host modules. Callables in
+    a module run on the host; return plain data, or wrap objects in
+    ``pydantic_monty.ClassInstance``. Unlike ``tools``, these calls do not
+    fire DSPy tool callbacks. ``execution_instructions`` describes each
+    module from its ``stubs``, or from its attribute names and signatures.
 
     State persists across ``execute()`` calls via ``MontySession``, Monty's
     incremental REPL session — each snippet is compiled and run against
@@ -279,6 +346,7 @@ class MontyInterpreter:
         callbacks: list[BaseCallback] | None = None,
         mount_listing_limit: int = _MOUNT_LISTING_LIMIT,
         os_policy: OSPolicy | None = None,
+        external_modules: Mapping[str, ExternalModule | Callable[[], ExternalModule]] | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
@@ -291,6 +359,8 @@ class MontyInterpreter:
         self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
+        # Passed through as-is: Monty reads the mapping live at import time.
+        self._external_modules = external_modules
         self._pool: Monty | None = None
         self._lock = threading.Lock()
         self._generation: int = 0
@@ -300,7 +370,9 @@ class MontyInterpreter:
         # Instance-level DSPy callbacks; dspy.settings.callbacks also apply.
         self.callbacks: list[BaseCallback] = list(callbacks or [])
         # Instance copy that also describes this interpreter's mounts.
-        self.execution_instructions: str = _build_execution_instructions(mounts, mount_listing_limit)
+        self.execution_instructions: str = _build_execution_instructions(
+            mounts, mount_listing_limit, external_modules
+        )
 
     @classmethod
     def factory(cls, **kwargs: Any) -> Callable[[], MontyInterpreter]:
@@ -342,7 +414,11 @@ class MontyInterpreter:
                     )
                     self._pool.__enter__()
                 pool = self._pool
-            session = pool.checkout(limits=self._resource_limits, os_policy=self._os_policy)
+            session = pool.checkout(
+                limits=self._resource_limits,
+                os_policy=self._os_policy,
+                external_modules=self._external_modules,
+            )
             session.__enter__()
             local.session = session
             with self._lock:
