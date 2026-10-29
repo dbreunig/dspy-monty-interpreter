@@ -879,7 +879,8 @@ def test_execution_instructions_describe_monty_limitations():
     assert "network" in text
     # Monty cannot pass builtin methods as values (max(d, key=d.get) fails).
     assert "key=d.get" in text
-    assert "decimal" in text
+    assert " decimal." in text
+    assert "statistics" in text
     # Monty 1.0 additions and long-standing syntax gaps.
     for mod in ("random", "time", "copy", "pathlib"):
         assert f" {mod}," in text or f" {mod}." in text
@@ -1198,6 +1199,15 @@ def test_monty_1_0_stdlib_modules_import():
         "random.seed(1)\n"
         "isinstance(time.time(), float) and copy.deepcopy([1])[0]"
     ) == "1"
+    interp.shutdown()
+
+
+def test_decimal_module_imports():
+    interp = MontyInterpreter()
+    assert interp.execute(
+        "from decimal import Decimal, ROUND_HALF_UP\n"
+        "print(Decimal('0.1') + Decimal('0.2'), Decimal('2.675').quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))"
+    ) == "0.3 2.68"
     interp.shutdown()
 
 
