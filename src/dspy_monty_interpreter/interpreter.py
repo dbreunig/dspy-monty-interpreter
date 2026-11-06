@@ -54,7 +54,7 @@ _BASE_EXECUTION_INSTRUCTIONS = (
         "Only these standard-library modules can be imported: re, json, math, datetime, "
         "time, random, collections, itertools, functools, dataclasses, copy, base64, "
         "binascii, typing, sys, os, os.path, pathlib, asyncio, unicodedata, csv, tomllib, "
-        "hashlib, bisect, decimal. "
+        "hashlib, bisect, decimal, fnmatch, annotationlib. "
         "Other stdlib modules (statistics, io, operator, string, heapq, enum, ...) and all "
         "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
         "There is no network access, no subprocesses, and no environment variables; "

@@ -879,7 +879,7 @@ def test_execution_instructions_describe_monty_limitations():
     assert "network" in text
     # Monty cannot pass builtin methods as values (max(d, key=d.get) fails).
     assert "key=d.get" in text
-    assert " decimal." in text
+    assert " annotationlib." in text
     assert "statistics" in text
     # Monty 1.0 additions and long-standing syntax gaps.
     for mod in ("random", "time", "copy", "pathlib"):
@@ -1208,6 +1208,24 @@ def test_decimal_module_imports():
         "from decimal import Decimal, ROUND_HALF_UP\n"
         "print(Decimal('0.1') + Decimal('0.2'), Decimal('2.675').quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))"
     ) == "0.3 2.68"
+    interp.shutdown()
+
+
+def test_fnmatch_and_annotationlib_modules_import():
+    interp = MontyInterpreter()
+    assert interp.execute(
+        "import fnmatch, annotationlib\n"
+        "print(fnmatch.fnmatch('q3.csv', '*.csv'))"
+    ) == "True"
+    interp.shutdown()
+
+
+def test_python_file_in_mount_is_importable(tmp_path):
+    (tmp_path / "helpers.py").write_text("X = 42\n")
+    interp = MontyInterpreter(
+        mounts=MountDir(virtual_path="/data", host_path=str(tmp_path), mode="read-only")
+    )
+    assert interp.execute("import helpers\nprint(helpers.X)") == "42"
     interp.shutdown()
 
 

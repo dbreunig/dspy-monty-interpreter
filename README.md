@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `fnmatch`, `annotationlib`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -89,6 +89,8 @@ Mounted directories (explore with os.listdir(path), pathlib.Path(path).iterdir()
 ```
 
 The sandbox's working directory starts at the first mount's virtual path (`/data` above, or `/` without mounts), so relative paths like `open('q3/summary.md')` resolve inside it, and `os.chdir()` persists across `execute()` calls.
+
+Sandboxed code can also `import` `.py` files from a mounted directory: with `helpers.py` in `./reports`, the example above lets the model run `import helpers`. Imported files run inside the sandbox under the same limits as any other code. Mount only code you are willing to let the model run.
 
 The listing is a snapshot of each host directory's top level at the time the factory is created, and it is bounded so a large mount cannot bloat the prompt. Up to 20 entries (`mount_listing_limit`) are listed by name; beyond that the model gets a summary instead, for example `1,204 files and 1 directory (.csv ×1200, .md ×4; e.g. 0000.csv, 0001.csv, 0002.csv)`. Individual names are cut at 40 characters, each mount's description at roughly 300, and the directory scan stops at 5,000 entries. Pass `mount_listing_limit=0` to describe only the path and mode. Without mounts the section says the filesystem is unavailable, so the model does not go looking for one. An instance created by the factory carries the same `execution_instructions` if you need them elsewhere.
 
