@@ -18,6 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Interpreters",
 ]
 dependencies = [
@@ -28,6 +29,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "python-dotenv>=1.0",
+]
+# Live RLM scripts in scripts/, which send traces to cmpnd.
+scripts = [
     "python-dotenv>=1.0",
     "cmpnd>=0.11.0",
 ]
@@ -40,3 +45,20 @@ markers = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dspy_monty_interpreter"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["tmp"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, import order, bugbear, pyupgrade
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ad hoc tooling with long prompt and description strings.
+"scripts/*" = ["E501"]
+"benchmarks/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-local-folder = ["_support"]

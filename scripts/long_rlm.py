@@ -8,8 +8,8 @@ Ground truth is computed on the host and the answer is graded.
 
 Requires OPENAI_API_KEY and CMPND_API_KEY in .env.
 
-    uv run scripts/long_rlm.py
-    uv run scripts/long_rlm.py --orders 50000 --model openai/gpt-5.6-luna
+    uv run --extra scripts scripts/long_rlm.py
+    uv run --extra scripts scripts/long_rlm.py --orders 50000 --model openai/gpt-5.6-luna
 """
 
 from __future__ import annotations

@@ -12,7 +12,7 @@ is visible in cmpnd on the LM-call spans; it is also printed here.
 
 Requires OPENAI_API_KEY and CMPND_API_KEY in .env.
 
-    uv run scripts/overlay_rlm.py
+    uv run --extra scripts scripts/overlay_rlm.py
 """
 
 from __future__ import annotations

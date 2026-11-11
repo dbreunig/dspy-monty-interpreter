@@ -6,8 +6,8 @@ sandbox tool calls) to cmpnd.
 
 Requires OPENAI_API_KEY and CMPND_API_KEY in .env (or the environment).
 
-    uv run scripts/smoke_rlm.py
-    uv run scripts/smoke_rlm.py --model openai/gpt-5.6-luna
+    uv run --extra scripts scripts/smoke_rlm.py
+    uv run --extra scripts scripts/smoke_rlm.py --model openai/gpt-5.6-luna
 """
 
 from __future__ import annotations

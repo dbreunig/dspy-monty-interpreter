@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -469,11 +468,11 @@ def print_comparison(monty: BenchmarkRun, python: BenchmarkRun) -> None:
     print(f"\n  {BOLD}Per-task breakdown:{RESET}")
     print(f"  {'Task':<34} {'Monty':>8}  {'Python':>8}  {'Speedup':>12}")
     print(f"  {'-' * 66}")
-    for mt, pt in zip(monty.tasks, python.tasks):
+    for mt, pt in zip(monty.tasks, python.tasks, strict=True):
         r = ratio_str(mt.time_ms, pt.time_ms)
         m_status = "   " if mt.error is None else f"{RED}ERR{RESET}"
         p_status = "   " if pt.error is None else f"{RED}ERR{RESET}"
-        print(f"  {mt.name:<34} {mt.time_ms:>6.2f}ms  {pt.time_ms:>6.2f}ms  {r:>24}")
+        print(f"  {mt.name:<34} {mt.time_ms:>6.2f}ms  {pt.time_ms:>6.2f}ms  {r:>24}  {m_status} {p_status}")
 
 
 def print_multi_run_summary(monty_runs: list[BenchmarkRun], python_runs: list[BenchmarkRun]) -> None:

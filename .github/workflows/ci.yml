@@ -6,19 +6,40 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint
+        run: uvx ruff@0.17.4 check --output-format github .
+
   test:
-    name: pytest (py${{ matrix.python-version }})
+    name: pytest (py${{ matrix.python-version }}, dspy ${{ matrix.dspy }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        dspy: ["latest"]
+        include:
+          # The oldest dspy that pyproject.toml allows. Code paths that depend
+          # on the dspy version, such as the sub-agent bridge, differ here.
+          - python-version: "3.12"
+            dspy: "3.4.0"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Install
         run: |
           uv venv --python ${{ matrix.python-version }}
-          uv pip install -e ".[dev]"
+          if [ "${{ matrix.dspy }}" = "latest" ]; then
+            uv pip install -e ".[dev]"
+          else
+            uv pip install -e ".[dev]" "dspy==${{ matrix.dspy }}"
+          fi
+      - name: Show versions
+        run: .venv/bin/python -c "import sys, dspy, importlib.metadata as m; print(sys.version); print('dspy', dspy.__version__); print('pydantic-monty', m.version('pydantic-monty'))"
       - name: Unit tests (no live LLM)
         run: .venv/bin/pytest -m "not e2e" -q

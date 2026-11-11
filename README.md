@@ -12,8 +12,6 @@ That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 pip install dspy-monty-interpreter
 ```
 
-Requires `dspy>=3.4.0` and `pydantic-monty>=1.1.0`. Since 1.0, `pydantic-monty` is a metapackage that installs `pydantic-monty-client` (the Python bindings) and `pydantic-monty-runtime` (the `monty` worker binary). If the binary comes from somewhere else, such as a base image, install `pydantic-monty-client` alone and point it at the binary with the `MONTY_BIN` environment variable.
-
 ## Usage
 
 ```python
@@ -157,6 +155,14 @@ The sandbox code can then run `from helpers import summarize` or `c = helpers.cl
 - Calls into a module don't fire DSPy's tool callbacks. Use `tools` when you need them traced.
 
 The sandbox has no `dir()` or `help()`, so the model learns a module's API from the prompt. `execution_instructions` lists each module's public attributes and function signatures, or shows its stubs when you pass `ExternalModule(attrs, stubs="def summarize(text: str) -> str: ...")`. Stubs over 4,000 characters are truncated. A module given as a factory is listed by name only, so the factory isn't called before the code needs it.
+
+## Object inputs
+
+RLM inputs that aren't plain data, such as your own classes or pydantic models, reach the sandbox as read-only proxies: the code can read their public attributes but can't call their methods. To expose a method, wrap the object in `ClassInstance` and list it in `allowed_methods`.
+
+## Sub-agents
+
+On DSPy 3.5 and later, RLM code can `import dspy` and build sub-agents. A `ReAct` sub-agent can use only the tools you passed to the RLM, not functions the model defines in the REPL, so pass every tool a sub-agent might need when you build the RLM.
 
 ## Clock, sleep, and randomness
 

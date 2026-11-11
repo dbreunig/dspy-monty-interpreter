@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import logging
 import os
 import re
 import threading
-from collections import Counter
-from collections.abc import Mapping
+from collections import ChainMap, Counter
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from dspy.primitives.code_interpreter import (
     CodeExecutionError,
@@ -32,6 +33,10 @@ from pydantic_monty import (
     ResourceLimits,
 )
 
+from dspy_monty_interpreter import bridge
+
+logger = logging.getLogger(__name__)
+
 _SUBMIT_HALT_MESSAGE = "SUBMIT() called; execution stopped"
 
 
@@ -46,31 +51,39 @@ _CODE_FENCE_RE = re.compile(
 )
 
 
+# Standard-library modules Monty can import. tests/test_interpreter.py checks
+# each claim against the installed Monty.
+_AVAILABLE_STDLIB = (
+    "re", "json", "math", "datetime", "time", "random", "collections", "itertools",
+    "functools", "dataclasses", "copy", "base64", "binascii", "typing", "sys", "os",
+    "os.path", "pathlib", "asyncio", "unicodedata", "csv", "tomllib", "hashlib",
+    "bisect", "decimal", "fnmatch", "annotationlib",
+)
+# Common stdlib modules Monty lacks, named so the model stops reaching for them.
+_UNAVAILABLE_STDLIB_EXAMPLES = ("statistics", "io", "operator", "string", "heapq", "enum")
+
 _BASE_EXECUTION_INSTRUCTIONS = (
-        "Python runs in Monty, a sandboxed interpreter written in Rust, not CPython. "
-        "State persists across executions: variables, functions, and classes defined in one "
-        "step are available in later steps. "
-        "Nothing is pre-imported; write the import statements you need. "
-        "Only these standard-library modules can be imported: re, json, math, datetime, "
-        "time, random, collections, itertools, functools, dataclasses, copy, base64, "
-        "binascii, typing, sys, os, os.path, pathlib, asyncio, unicodedata, csv, tomllib, "
-        "hashlib, bisect, decimal, fnmatch, annotationlib. "
-        "Other stdlib modules (statistics, io, operator, string, heapq, enum, ...) and all "
-        "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
-        "There is no network access, no subprocesses, and no environment variables; "
-        "datetime.now() and time.time() do work. "
-        "Supported syntax includes classes, decorators, @dataclass, complex numbers, comprehensions, "
-        "generator expressions, lambdas, with statements, try/except, and match statements; "
-        "generator functions (yield) are NOT supported, nor are class inheritance "
-        "(including subclassing Exception), or a callable replacement in re.sub(). "
-        "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
-        "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
-        "max(d, key=lambda k: d[k]) or max(d.items(), key=lambda kv: kv[1]). "
-        "print() output is returned to you; a bare expression on the last line is returned "
-        "only when nothing was printed. "
-        "SUBMIT() stops execution immediately, so print and inspect results in an earlier "
-        "step before calling it."
-    )
+    "Python runs in Monty, a sandboxed interpreter written in Rust, not CPython. "
+    "State persists across executions: variables, functions, and classes defined in one "
+    "step are available in later steps. "
+    "Nothing is pre-imported; write the import statements you need. "
+    f"Only these standard-library modules can be imported: {', '.join(_AVAILABLE_STDLIB)}. "
+    f"Other stdlib modules ({', '.join(_UNAVAILABLE_STDLIB_EXAMPLES)}, ...) and all "
+    "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
+    "There is no network access, no subprocesses, and no environment variables; "
+    "datetime.now() and time.time() do work. "
+    "Supported syntax includes classes, decorators, @dataclass, complex numbers, comprehensions, "
+    "generator expressions, lambdas, with statements, try/except, and match statements; "
+    "generator functions (yield) are NOT supported, nor are class inheritance "
+    "(including subclassing Exception), or a callable replacement in re.sub(). "
+    "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
+    "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
+    "max(d, key=lambda k: d[k]) or max(d.items(), key=lambda kv: kv[1]). "
+    "print() output is returned to you; a bare expression on the last line is returned "
+    "only when nothing was printed. "
+    "SUBMIT() stops execution immediately, so print and inspect results in an earlier "
+    "step before calling it."
+)
 
 _NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted."
 
@@ -235,6 +248,7 @@ def _build_execution_instructions(
     sections = [_BASE_EXECUTION_INSTRUCTIONS, _describe_mounts(mounts, listing_limit)]
     if modules_text := _describe_external_modules(external_modules):
         sections.append(modules_text)
+    sections.append(bridge.instructions())
     return "\n".join(sections)
 
 
@@ -359,8 +373,14 @@ class MontyInterpreter:
         self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
-        # Passed through as-is: Monty reads the mapping live at import time.
+        # Monty reads the mapping live at import time, so the user's mapping
+        # is chained rather than copied.
         self._external_modules = external_modules
+        self._session_modules: Mapping[str, Any] | None = external_modules
+        if bridge.SUPPORTED:
+            self._session_modules = ChainMap(
+                external_modules or {}, {"dspy": lambda: bridge.dspy_module(self._tools)}
+            )
         self._pool: Monty | None = None
         self._lock = threading.Lock()
         self._generation: int = 0
@@ -417,7 +437,7 @@ class MontyInterpreter:
             session = pool.checkout(
                 limits=self._resource_limits,
                 os_policy=self._os_policy,
-                external_modules=self._external_modules,
+                external_modules=self._session_modules,
             )
             session.__enter__()
             local.session = session
@@ -435,7 +455,8 @@ class MontyInterpreter:
             try:
                 session.__exit__(None, None, None)
             except Exception:
-                pass
+                # The worker is being discarded either way.
+                logger.debug("Returning a Monty session to the pool failed", exc_info=True)
             self._thread_local.session = None
         self._thread_local.has_state = False
 
@@ -516,8 +537,13 @@ class MontyInterpreter:
                 session and its state are lost; RLM treats this as terminal.
             SyntaxError: On syntax errors.
         """
-        variables = variables or {}
+        variables = dict(variables or {})
+        if bridge.is_bootstrap(code, variables):
+            bridge.answer_bootstrap(variables)
+            return None
         code = _strip_code_fences(code)
+        code, raw_lookups = bridge.take_raw_variables(code, variables)
+        variables = {name: bridge.to_monty(value) for name, value in variables.items()}
 
         print_output: list[str] = []
 
@@ -534,8 +560,9 @@ class MontyInterpreter:
             raise _SubmitHalt(_SUBMIT_HALT_MESSAGE)
 
         external_fns: dict[str, Callable[..., Any]] = {
-            name: self._make_external_fn(name) for name in self._tools
+            name: self._make_external_fn(name) for name in self._tools if not bridge.is_bridge_tool(name)
         }
+        external_fns.update(raw_lookups)
         external_fns["SUBMIT"] = submit_fn
 
         session = self._ensure_session()
@@ -595,12 +622,13 @@ class MontyInterpreter:
             try:
                 session.__exit__(None, None, None)
             except Exception:
-                pass
+                # The worker is being discarded either way.
+                logger.debug("Returning a Monty session to the pool failed", exc_info=True)
         if pool is not None:
             try:
                 pool.__exit__(None, None, None)
             except Exception:
-                pass
+                logger.debug("Shutting down the Monty worker pool failed", exc_info=True)
         self.__tools_registered = False
 
     def __enter__(self) -> MontyInterpreter:
@@ -630,7 +658,8 @@ def _handle_submit(
             and set(args[0].keys()).issubset(field_names)
         ):
             return FinalOutput(dict(args[0]))
-        return FinalOutput(dict(zip(field_names, args)))
+        # SUBMIT may pass fewer or more values than there are output fields.
+        return FinalOutput(dict(zip(field_names, args, strict=False)))
     if len(args) == 1:
         return FinalOutput(args[0])
     if len(args) == 0:
