@@ -354,3 +354,25 @@ def test_os_access_clock_override_needs_call_host():
 def test_factory_passes_os_policy():
     factory = MontyInterpreter.factory(os_policy={"sleep": "system"})
     assert factory()._os_policy == {"sleep": "system"}
+
+
+def test_default_allows_more_than_monty_suspension_default():
+    """Monty caps a session at 1000 host calls by default. An RLM run that
+    loops a tool over its data needs more, so the adapter raises the cap."""
+    interp = MontyInterpreter(tools={"f": lambda x: x})
+    code = "t = 0\nfor i in range(700):\n    t += f(x=i)\nprint(t)"
+    assert interp.execute(code) == "244650"
+    assert interp.execute(code) == "244650"
+    interp.shutdown()
+
+
+def test_suspension_limit_message_explains_cap():
+    from dspy.primitives.code_interpreter import CodeExecutionError
+
+    interp = MontyInterpreter(tools={"f": lambda x: x}, resource_limits={"max_suspensions": 3})
+    with pytest.raises(CodeExecutionError, match=r"at most 3 calls to tools.*per run"):
+        interp.execute("for i in range(5):\n    f(x=i)")
+    # State survives the error.
+    interp.execute("y = 2")
+    assert interp.execute("print(y)") == "2"
+    interp.shutdown()

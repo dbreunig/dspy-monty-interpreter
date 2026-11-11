@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `fnmatch`, `annotationlib`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `fnmatch`, `annotationlib`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. The adapter makes subclasses of `dspy.Module` and `dspy.Signature` work (see [dspy.Flex](#dspyflex)). It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -162,7 +162,52 @@ RLM inputs that aren't plain data, such as your own classes or pydantic models, 
 
 ## Sub-agents
 
-On DSPy 3.5 and later, RLM code can `import dspy` and build sub-agents. A `ReAct` sub-agent can use only the tools you passed to the RLM, not functions the model defines in the REPL, so pass every tool a sub-agent might need when you build the RLM.
+On DSPy 3.5 and later, RLM code can `import dspy` and build sub-agents with `dspy.Predict`, `dspy.ChainOfThought`, `dspy.ReAct`, and `dspy.RLM`. The sub-agents run on the host with your LM. Their LM calls count against the RLM's `max_llm_calls`. Their results support `r.answer`, `r["answer"]`, and `"answer" in r`.
+
+A `ReAct` sub-agent accepts the tools you passed to the RLM and functions the model defines in the REPL. A REPL function runs inside the sandbox and can read the REPL's variables. The agent itself runs on the host. The adapter builds the tool description from the function's signature and docstring. A nested `RLM` sub-agent accepts only the tools you passed.
+
+## dspy.Flex
+
+`dspy.Flex` runs a `dspy.Module` whose source code `dspy.GEPA` can rewrite. Pass the factory as its interpreter, or make Monty the default with `dspy.configure`:
+
+```python
+flex = dspy.Flex("question -> answer", interpreter_factory=MontyInterpreter)
+result = flex(question="What is 2 + 2?")
+```
+
+Monty has no class inheritance. The adapter therefore rewrites the module source before it runs. A `dspy.Module` subclass loses its base and its `super().__init__()` call and gains a `__call__` that runs `forward`. A `dspy.Signature` class becomes a signature the host builds from its field declarations. The rewrite keeps line numbers. Error messages therefore point at the code as written. Module code can call Flex tools by name. Values of the signature's custom types arrive as plain dicts. Every predictor call counts against `max_predictor_calls`.
+
+GEPA's code proposer doesn't see the interpreter's limits. A proposed module may use a feature Monty lacks, such as `yield`. That candidate fails with an error, and GEPA's reflection reads the error.
+
+## Type checking
+
+Pass `type_check=True` to check each code block with Monty's type checker before it runs:
+
+```python
+rlm = dspy.RLM(
+    "context -> answer",
+    tools=[search],
+    interpreter_factory=MontyInterpreter.factory(type_check=True),
+)
+```
+
+The checker knows your tools' signatures, the input variables' types, and the sandbox's `dspy` namespace. It catches a wrong argument type, a misspelled name, or `context + 1` on a string input before any of the block runs. A rejected block leaves the REPL state untouched. The prompt tells the model about the check. Variables the code assigns may change type in later blocks. The checker is strict. It rejects `d.get(key) + 1`, for example, because `get` may return `None`. It suits models that write careful code.
+
+## Conversations
+
+Each RLM call gets a fresh interpreter. REPL variables therefore vanish between the turns of a conversation. Pass a `SessionState` to keep them:
+
+```python
+from dspy_monty_interpreter import SessionState
+
+state = SessionState()  # one per conversation
+rlm = dspy.RLM("question -> answer", interpreter_factory=MontyInterpreter.factory(state=state))
+
+first = rlm(question="Load the sales figures into a variable.")
+second = rlm(question="Now chart them by month.", history=first.history)
+```
+
+The interpreter saves its session into `state` when it shuts down, and the next interpreter restores it. Variables, functions, and classes carry over. Input proxies and sub-agents from an earlier turn don't carry over and must be made again. `state.data` holds the serialized session as bytes. You can store those bytes between processes. Load only bytes your own code produced.
 
 ## Clock, sleep, and randomness
 
@@ -196,7 +241,7 @@ interp = MontyInterpreter(
 )
 ```
 
-Two keys cap execution time: `max_feed_duration_secs` limits one `execute()` call, and `max_turn_duration_secs` limits the sandbox time between tool calls. Both count only time spent running sandboxed code, not time waiting on your tools. Other keys are `max_recursion_depth` and `max_suspensions` (both default to 1000 and cannot be disabled), `max_total_sleep_secs`, and `gc_interval`. Monty rejects unknown keys with a `ValueError` on the first `execute()`.
+Two keys cap execution time: `max_feed_duration_secs` limits one `execute()` call, and `max_turn_duration_secs` limits the sandbox time between tool calls. Both count only time spent running sandboxed code, not time waiting on your tools. `max_suspensions` caps the host calls (tools, `llm_query`, sub-agents) one session may make. Monty's default of 1000 is too low for an RLM that loops a tool over its data. The adapter raises it to 1,000,000. Other keys are `max_recursion_depth` (default 1000), `max_total_sleep_secs`, and `gc_interval`. Monty rejects unknown keys with a `ValueError` on the first `execute()`.
 
 A limit violation surfaces as a `CodeExecutionError` from `execute()`, which RLM feeds back to the model. After a memory, recursion, or suspension limit the session keeps its state. After a time limit Monty makes no guarantees about the sandbox heap, so the adapter discards the session: the next `execute()` starts with empty state, and the error message tells the model so.
 
@@ -209,6 +254,16 @@ interp = MontyInterpreter(request_timeout=10.0)
 ```
 
 When code exceeds the limit, `execute()` raises `CodeInterpreterError`. The session state is lost, and the next `execute()` starts fresh. (Ordinary runtime errors in the code raise `CodeExecutionError`, a subclass that RLM feeds back to the model as a correction turn; a timeout is terminal and ends the RLM run.)
+
+## Remote sandboxes
+
+Pass `remote` with the URL of a [`monty-server`](https://github.com/pydantic/monty) to run code on a remote machine:
+
+```python
+interp_factory = MontyInterpreter.factory(remote="https://sandbox.internal:8799", request_timeout=30.0)
+```
+
+Tools, `llm_query`, and sub-agents still run in your process, and the remote worker calls back to them. `request_timeout` and `max_processes` configure the remote pool. For other options, such as authentication metadata, pass a zero-argument callable that returns a `pydantic_monty.AsyncMontyRemote`. A dropped or refused connection raises `CodeInterpreterError`. RLM ends the run on that error.
 
 ## Parallel evaluation
 
@@ -228,6 +283,14 @@ A pool starts its worker lazily on the first `execute()`, in a few milliseconds,
 ## Observability
 
 `MontyInterpreter` fires DSPy's interpreter lifecycle callbacks: `on_interpreter_startup_*`, `on_interpreter_execute_*`, `on_interpreter_tool_call_*`, and `on_interpreter_shutdown_*`. Register a `dspy.utils.callback.BaseCallback` globally with `dspy.configure(callbacks=[...])` or per instance with `MontyInterpreter(callbacks=[...])`. Tool calls nest under the `execute()` call that made them, so traces keep their ancestry.
+
+With `opentelemetry-api` installed (`pip install dspy-monty-interpreter[telemetry]`), each `execute()` call also records a `monty.execute` span with its outcome: `output`, `none`, `submit`, or `error`. Call `instrument()` once to add Monty's own spans and metrics. Monty records a span per session, with a child span for each code run and a grandchild for each host call. The session span starts inside the first `monty.execute` of the session:
+
+```python
+from dspy_monty_interpreter import instrument
+
+instrument()  # uses the global OpenTelemetry providers
+```
 
 ## Why Monty?
 

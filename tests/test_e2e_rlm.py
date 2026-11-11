@@ -138,3 +138,32 @@ def test_rlm_awaits_async_tool_via_acall():
 
     result = asyncio.run(rlm.acall(city="Paris"))
     assert int(result.population) == 2161000
+
+
+def test_flex_module_runs_predictors_and_repl_tools_via_monty():
+    """A Flex module with a predictor and a ReAct agent whose tool is a
+    function defined inside forward, all running against a live LLM."""
+    dspy.configure(lm=_select_lm())
+
+    src = '''
+class SolveModule(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.extract = dspy.Predict("text: str -> numbers: list[int]")
+
+    def forward(self, **inputs):
+        numbers = self.extract(text=inputs["text"]).numbers
+
+        def multiply(values: list[int]) -> int:
+            """Multiply a list of integers together."""
+            total = 1
+            for v in values:
+                total = total * v
+            return total
+
+        agent = dspy.ReAct("numbers: list[int] -> product: int", tools=[multiply], max_iters=4)
+        return dspy.Prediction(product=agent(numbers=numbers).product)
+'''
+    flex = dspy.Flex("text: str -> product: int", interpreter_factory=MontyInterpreter)
+    flex.load_state({"module_src": src})
+    assert flex(text="Multiply two, three, five and seven.").product == 210

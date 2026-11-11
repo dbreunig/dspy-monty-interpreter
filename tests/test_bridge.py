@@ -158,17 +158,74 @@ def test_rlm_react_sub_agent_uses_provided_tools():
 
 
 @needs_bridge
-def test_rlm_react_rejects_repl_functions():
+def test_rlm_react_runs_repl_functions_in_the_sandbox():
+    """A REPL function handed to ReAct runs in the sandbox, with the REPL's
+    state, while the agent itself runs on the host."""
+    import dspy
+    from dspy.utils.dummies import DummyLM
+
+    code = (
+        "import dspy\n"
+        "rates = {'EUR': 2}\n"
+        "def convert(amount: int, currency: str) -> int:\n"
+        "    \"\"\"Convert an amount to dollars.\"\"\"\n"
+        "    return amount * rates[currency]\n"
+        "r = dspy.ReAct('amount -> dollars', tools=[convert])(amount='3 EUR')\n"
+        "print(r.dollars, r['dollars'], 'dollars' in r)"
+    )
+    lm = DummyLM([
+        {"plan": "p", "code": code},
+        {
+            "next_thought": "convert",
+            "tool_calls": {"tool_calls": [{"name": "convert", "args": {"amount": 3, "currency": "EUR"}}]},
+        },
+        {"next_thought": "done", "tool_calls": {"tool_calls": [{"name": "submit", "args": {"dollars": "6"}}]}},
+        {"plan": "done", "code": "SUBMIT(a=r.dollars)"},
+    ])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter, max_iters=3)
+        result = rlm(q="x")
+    assert result.a == "6"
+    assert result.trajectory[0]["output"] == "6 6 True"
+    react_prompt = str(lm.history[1]["messages"])
+    assert "convert" in react_prompt and "Convert an amount to dollars." in react_prompt
+
+
+@needs_bridge
+def test_repl_function_errors_reach_react_as_observations():
+    import dspy
+    from dspy.utils.dummies import DummyLM
+
+    code = (
+        "def boom(x: str) -> str:\n"
+        "    raise ValueError('bad ' + x)\n"
+        "r = dspy.ReAct('q -> a', tools=[boom])(q='go')\n"
+        "print(r.a)"
+    )
+    lm = DummyLM([
+        {"plan": "p", "code": code},
+        {"next_thought": "try", "tool_calls": {"tool_calls": [{"name": "boom", "args": {"x": "y"}}]}},
+        {"next_thought": "done", "tool_calls": {"tool_calls": [{"name": "submit", "args": {"a": "recovered"}}]}},
+        {"plan": "done", "code": "SUBMIT(a=r.a)"},
+    ])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter, max_iters=3)
+        assert rlm(q="x").a == "recovered"
+    assert "ValueError: bad y" in str(lm.history[2]["messages"])
+
+
+@needs_bridge
+def test_rlm_sub_agent_rejects_repl_functions():
     import dspy
 
     lm = dummy_lm([
-        ("p", "import dspy\ndef f(x):\n    return x\ndspy.ReAct('q -> a', tools=[f])"),
+        ("p", "import dspy\ndef f(x):\n    return x\ndspy.RLM('q -> a', tools=[f])"),
         ("done", "SUBMIT(a='stopped')"),
     ])
     with dspy.context(lm=lm):
         rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter, max_iters=3)
         result = rlm(q="x")
-    assert "ReAct tools must be the provided tools" in result.trajectory[0]["output"]
+    assert "RLM tools must be the provided tools" in result.trajectory[0]["output"]
 
 
 def test_caller_wrapped_objects_keep_their_own_policy():
@@ -232,3 +289,68 @@ def test_rlm_sub_agent_calls_count_against_max_llm_calls():
         result = rlm(q="x")
     assert "LLM call limit exceeded" in result.trajectory[0]["output"]
     assert result.a == "one"
+
+
+@needs_bridge
+def test_orphaned_agent_run_is_cancelled_when_its_snippet_ends():
+    """Sandbox code that starts an agent run and never resumes it leaves a
+    paused host thread; the snippet's end stops it, and the agent works again."""
+    import threading
+    import time
+
+    import dspy
+    from dspy.utils.dummies import DummyLM
+
+    step = {"next_thought": "use f", "tool_calls": {"tool_calls": [{"name": "f", "args": {"x": "a"}}]}}
+    done = {"next_thought": "done", "tool_calls": {"tool_calls": [{"name": "submit", "args": {"a": "ok"}}]}}
+    interp = MontyInterpreter()
+    try:
+        interp.execute("def f(x: str) -> str:\n    return x\nagent = dspy.ReAct('q -> a', tools=[f])")
+        before = threading.active_count()
+        with dspy.context(lm=DummyLM([step, step, done])):
+            # Start a run by hand and abandon it at the REPL-function call.
+            assert interp.execute("_dspy_host.call(agent._handle, {'q': 'x'})['kind']") == "call"
+            assert interp.execute("print(agent(q='y').a)") == "ok"
+        deadline = time.monotonic() + 2
+        while threading.active_count() > before and time.monotonic() < deadline:
+            time.sleep(0.01)  # agent threads exit just after their last event
+        assert threading.active_count() <= before
+    finally:
+        interp.shutdown()
+
+
+@needs_bridge
+def test_prediction_fields_named_like_methods():
+    import dspy
+    from dspy.utils.dummies import DummyLM
+
+    interp = MontyInterpreter()
+    try:
+        with dspy.context(lm=DummyLM([{"keys": "a, b", "get": "g"}])):
+            out = interp.execute("p = dspy.Predict('t -> keys, get')(t='x')\nprint(p['keys'], p['get'], p.keys())")
+        assert out == "a, b g ['keys', 'get']"
+    finally:
+        interp.shutdown()
+
+
+@needs_bridge
+def test_sub_agent_rlm_does_not_share_conversation_state():
+    import dspy
+    from dspy.utils.dummies import DummyLM
+
+    from dspy_monty_interpreter import SessionState
+
+    state = SessionState()
+    lm = DummyLM([
+        {"plan": "p", "code": "secret = 'outer'\nr = dspy.RLM('q -> a', max_iters=2)(q='inner')\nprint(r.a)"},
+        {"plan": "inner", "code": "try:\n    seen = secret\nexcept NameError:\n    seen = 'isolated'\nSUBMIT(a=seen)"},
+        {"plan": "done", "code": "SUBMIT(a=r.a)"},
+    ])
+    with dspy.context(lm=lm):
+        rlm = dspy.RLM("q -> a", interpreter_factory=MontyInterpreter.factory(state=state), max_iters=3)
+        assert rlm(q="x").a == "isolated"
+    after = MontyInterpreter(state=state)
+    try:
+        assert after.execute("print(secret)") == "outer"
+    finally:
+        after.shutdown()

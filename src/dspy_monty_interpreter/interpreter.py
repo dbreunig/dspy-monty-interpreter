@@ -22,18 +22,24 @@ from dspy.primitives.code_interpreter import (
 from dspy.utils.callback import BaseCallback, with_callbacks
 from pydantic_monty import (
     AbstractOS,
+    AsyncMontyRemote,
     ExternalModule,
     Monty,
+    MontyConnectError,
     MontyCrashedError,
+    MontyDisconnectError,
+    MontyRefusedError,
     MontyRuntimeError,
     MontySession,
+    MontyShutdown,
     MontySyntaxError,
+    MontyTypingError,
     MountDir,
     OSPolicy,
     ResourceLimits,
 )
 
-from dspy_monty_interpreter import bridge
+from dspy_monty_interpreter import bridge, remote, rewrite, telemetry, typecheck
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,12 @@ _BASE_EXECUTION_INSTRUCTIONS = (
 _NO_FILESYSTEM_INSTRUCTIONS = "The filesystem is unavailable: no directories are mounted."
 
 _DEFAULT_OS_POLICY: OSPolicy = {"sleep": "zero"}
+
+# Monty's own default of 1000 host calls per session is too low for an RLM run
+# that loops a tool over its data. Each call costs about 80µs, so this cap
+# still stops a runaway loop within a couple of minutes.
+_DEFAULT_MAX_SUSPENSIONS = 1_000_000
+_SUSPENSION_LIMIT_RE = re.compile(r"suspension limit (\d+) exceeded")
 
 _MOUNT_MODE_DESCRIPTIONS = {
     "read-only": "read-only",
@@ -240,16 +252,74 @@ def _describe_module_attrs(module: ExternalModule) -> str:
     return ", ".join(parts) or "(no public attributes)"
 
 
+_TYPE_CHECK_INSTRUCTIONS = (
+    "Each code block is type-checked before it runs. A block that fails the check does not run at all, "
+    "so fix the reported error and resend the whole block."
+)
+
+
 def _build_execution_instructions(
     mounts: MountDir | list[MountDir] | None,
     listing_limit: int = _MOUNT_LISTING_LIMIT,
     external_modules: Mapping[str, Any] | None = None,
+    type_check: bool = False,
+    persistent: bool = False,
 ) -> str:
     sections = [_BASE_EXECUTION_INSTRUCTIONS, _describe_mounts(mounts, listing_limit)]
+    if type_check:
+        sections.append(_TYPE_CHECK_INSTRUCTIONS)
+    if persistent:
+        sections.append(_PERSISTENT_STATE_INSTRUCTIONS)
     if modules_text := _describe_external_modules(external_modules):
         sections.append(modules_text)
     sections.append(bridge.instructions())
     return "\n".join(sections)
+
+
+class SessionState:
+    """REPL state carried from one interpreter to the next.
+
+    Pass one to ``MontyInterpreter.factory(state=...)`` to keep variables,
+    functions and classes across ``dspy.RLM`` calls, such as the turns of a
+    conversation. Each interpreter restores the state when its session
+    starts and saves it when it shuts down. Host objects do not carry over:
+    proxied inputs and sub-agents built with ``dspy`` must be made again.
+
+    Use one state per conversation. ``data`` holds Monty's serialized
+    session; only load bytes this process produced or otherwise trusts.
+    """
+
+    def __init__(self, data: bytes | None = None) -> None:
+        self._lock = threading.Lock()
+        self._data = data
+
+    @property
+    def data(self) -> bytes | None:
+        with self._lock:
+            return self._data
+
+    @data.setter
+    def data(self, value: bytes | None) -> None:
+        with self._lock:
+            self._data = value
+
+    def clear(self) -> None:
+        self.data = None
+
+    def __repr__(self) -> str:
+        size = len(self.data or b"")
+        return f"SessionState({size:,} bytes)" if size else "SessionState(empty)"
+
+
+_PERSISTENT_STATE_INSTRUCTIONS = (
+    "Variables, functions and classes from earlier calls in this conversation persist; "
+    "sub-agents and input proxies from earlier calls do not."
+)
+
+
+# True while execute() runs in this context. Interpreters made then belong to
+# sub-agents built in the sandbox, which must not share a conversation's state.
+_inside_execute: contextvars.ContextVar[bool] = contextvars.ContextVar("dspy_monty_inside_execute", default=False)
 
 
 class _MontyFactory:
@@ -265,9 +335,13 @@ class _MontyFactory:
             kwargs.get("mounts"),
             kwargs.get("mount_listing_limit", _MOUNT_LISTING_LIMIT),
             kwargs.get("external_modules"),
+            kwargs.get("type_check", False),
+            kwargs.get("state") is not None,
         )
 
     def __call__(self) -> MontyInterpreter:
+        if _inside_execute.get() and "state" in self._kwargs:
+            return MontyInterpreter(**{k: v for k, v in self._kwargs.items() if k != "state"})
         return MontyInterpreter(**self._kwargs)
 
     def __repr__(self) -> str:
@@ -288,12 +362,14 @@ class MontyInterpreter:
     cap each ``execute()`` call. ``max_memory`` (bytes) is enforced by
     Monty's allocator, so a runaway allocation raises ``MemoryError`` in the
     sandbox rather than on the host; it surfaces as ``CodeExecutionError``
-    and the session keeps its state. ``max_feed_duration_secs`` caps one
+    and the session keeps its state. ``max_suspensions`` caps the host calls (tools, ``llm_query``, host
+    module functions) one session may make; the adapter raises Monty's
+    default of 1000 to 1,000,000. ``max_feed_duration_secs`` caps one
     ``execute()`` call and ``max_turn_duration_secs`` caps the sandbox time
     between host calls; Monty makes no guarantees about the heap after
     either fires, so the adapter discards the session and the next
     ``execute()`` starts with empty state. Other keys: ``max_recursion_depth``,
-    ``max_suspensions``, ``max_total_sleep_secs``, ``gc_interval``.
+    ``max_total_sleep_secs``, ``gc_interval``.
 
     Pass ``os_policy`` (a ``pydantic_monty.OSPolicy`` dict) to control the
     sandbox's clock, timezone, sleep, and random seed. The adapter defaults
@@ -309,6 +385,19 @@ class MontyInterpreter:
     ``pydantic_monty.ClassInstance``. Unlike ``tools``, these calls do not
     fire DSPy tool callbacks. ``execution_instructions`` describes each
     module from its ``stubs``, or from its attribute names and signatures.
+
+    Pass ``type_check=True`` to type-check each snippet before it runs,
+    against stubs built from the tools' signatures, the input variables'
+    types, and the sandbox's ``dspy`` namespace. A snippet that fails the
+    check raises ``CodeExecutionError`` without running, so the session's
+    state is untouched. The checker is strict (``d.get(k) + 1`` fails
+    because ``get`` may return ``None``), so it suits models that write
+    careful code.
+
+    Pass ``state`` (a ``SessionState``) to carry REPL variables, functions
+    and classes from one interpreter to the next, such as across the turns
+    of an RLM conversation: the session is restored when it starts and
+    saved at ``shutdown()``.
 
     State persists across ``execute()`` calls via ``MontySession``, Monty's
     incremental REPL session — each snippet is compiled and run against
@@ -361,11 +450,17 @@ class MontyInterpreter:
         mount_listing_limit: int = _MOUNT_LISTING_LIMIT,
         os_policy: OSPolicy | None = None,
         external_modules: Mapping[str, ExternalModule | Callable[[], ExternalModule]] | None = None,
+        type_check: bool = False,
+        state: SessionState | None = None,
+        remote: str | Callable[[], Any] | None = None,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
         self.__tools_registered: bool = False
-        self._resource_limits: ResourceLimits | None = resource_limits
+        self._resource_limits: ResourceLimits = {
+            "max_suspensions": _DEFAULT_MAX_SUSPENSIONS,
+            **(resource_limits or {}),
+        }
         self._mounts: MountDir | list[MountDir] | None = mounts
         self._os_access: AbstractOS | None = os_access
         # Sandbox code has nothing to wait for, so sleeping only holds a
@@ -373,13 +468,18 @@ class MontyInterpreter:
         self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
+        self._type_check = type_check
+        self._state = state
+        self._remote = remote
         # Monty reads the mapping live at import time, so the user's mapping
         # is chained rather than copied.
         self._external_modules = external_modules
         self._session_modules: Mapping[str, Any] | None = external_modules
+        self._bridge: bridge.BridgeContext | None = None
         if bridge.SUPPORTED:
+            self._bridge = bridge.BridgeContext(self._tools)
             self._session_modules = ChainMap(
-                external_modules or {}, {"dspy": lambda: bridge.dspy_module(self._tools)}
+                external_modules or {}, {bridge.HOST_MODULE: lambda: bridge.dspy_module(self._bridge)}
             )
         self._pool: Monty | None = None
         self._lock = threading.Lock()
@@ -391,7 +491,7 @@ class MontyInterpreter:
         self.callbacks: list[BaseCallback] = list(callbacks or [])
         # Instance copy that also describes this interpreter's mounts.
         self.execution_instructions: str = _build_execution_instructions(
-            mounts, mount_listing_limit, external_modules
+            mounts, mount_listing_limit, external_modules, type_check, state is not None
         )
 
     @classmethod
@@ -428,26 +528,93 @@ class MontyInterpreter:
         if getattr(local, "session", None) is None:
             with self._lock:
                 if self._pool is None:
-                    self._pool = Monty(
-                        request_timeout=self._request_timeout,
-                        max_processes=self._max_processes,
-                    )
+                    self._pool = self._make_pool()
                     self._pool.__enter__()
                 pool = self._pool
             session = pool.checkout(
                 limits=self._resource_limits,
                 os_policy=self._os_policy,
                 external_modules=self._session_modules,
+                type_check=self._type_check,
+                type_check_stubs=self._type_stubs() if self._type_check else None,
+                type_check_format="concise",
             )
-            session.__enter__()
+            local.declared = set()  # input variables declared to the type checker
+            try:
+                session.__enter__()
+            except (MontyConnectError, MontyRefusedError, MontyDisconnectError) as e:
+                raise CodeInterpreterError(f"Could not open a Monty session: {e}") from e
+            try:
+                restored = self._restore_state(session)
+                if self._bridge is not None:
+                    # Defines the sandbox's ``dspy`` namespace in every new session.
+                    # The first feed sets the working directory from its mounts.
+                    # The type checker learns its names from PRELUDE_STUBS instead.
+                    session.feed_run(
+                        bridge.PRELUDE, print_callback=lambda *_: None, mount=self._mounts, skip_type_check=True
+                    )
+            except BaseException as e:
+                # Return the worker; the next execute() checks out a fresh session.
+                try:
+                    session.__exit__(None, None, None)
+                except Exception:
+                    logger.debug("Returning a Monty session to the pool failed", exc_info=True)
+                if isinstance(e, (MontyCrashedError, MontyDisconnectError, MontyShutdown, MontyRefusedError)):
+                    raise CodeInterpreterError(f"Could not prepare a Monty session: {e}") from e
+                raise
+            if restored:
+                local.has_state = True
             local.session = session
             with self._lock:
                 self._live_sessions[id(session)] = session
         return local.session
 
+    def _make_pool(self) -> Any:
+        """A local subprocess pool, or a sync facade over a remote one."""
+        if self._remote is None:
+            return Monty(request_timeout=self._request_timeout, max_processes=self._max_processes)
+        if callable(self._remote):
+            return remote.SyncPool(self._remote)
+        options: dict[str, Any] = {}
+        if self._request_timeout is not None:
+            options["request_timeout"] = self._request_timeout
+        if self._max_processes is not None:
+            options["max_processes"] = self._max_processes
+        url = self._remote
+        return remote.SyncPool(lambda: AsyncMontyRemote(url, **options))
+
+    def _restore_state(self, session: MontySession) -> bool:
+        """Load the saved state into a new session; True if there was any."""
+        data = self._state.data if self._state is not None else None
+        if not data:
+            return False
+        try:
+            session.load_session(data)
+        except Exception:
+            logger.warning("Could not restore the saved Monty session; starting empty", exc_info=True)
+            return False
+        return True
+
+    def _save_state(self, sessions: list[MontySession]) -> None:
+        """Save the calling thread's session, or the only one, into the state."""
+        if self._state is None or not sessions:
+            return
+        local = self._thread_local
+        own = getattr(local, "session", None) if getattr(local, "generation", None) == self._generation else None
+        session = own if own in sessions else sessions[0] if len(sessions) == 1 else None
+        if session is None:
+            logger.warning("Not saving Monty session state: several threads hold sessions")
+            return
+        try:
+            self._state.data = session.dump()
+        except Exception:
+            logger.warning("Could not save the Monty session state", exc_info=True)
+
     def _discard_session(self) -> None:
         """Return the calling thread's worker to the pool; the thread's
         next execute() checks out a fresh session with empty state."""
+        if self._bridge is not None:
+            self._bridge.cancel_runs(threading.get_ident())
         session = getattr(self._thread_local, "session", None)
         if session is not None:
             with self._lock:
@@ -516,6 +683,7 @@ class MontyInterpreter:
         self._ensure_session()
 
     @with_callbacks
+    @telemetry.traced_execute
     def execute(
         self,
         code: str,
@@ -537,11 +705,30 @@ class MontyInterpreter:
                 session and its state are lost; RLM treats this as terminal.
             SyntaxError: On syntax errors.
         """
+        token = _inside_execute.set(True)
+        try:
+            return self._execute(code, variables)
+        finally:
+            _inside_execute.reset(token)
+            if self._bridge is not None:
+                # Sandbox code resumes a sub-agent only within the snippet
+                # that started it, so a run still paused now is orphaned.
+                self._bridge.cancel_runs(threading.get_ident())
+
+    def _execute(self, code: str, variables: dict[str, Any] | None) -> Any:
         variables = dict(variables or {})
         if bridge.is_bootstrap(code, variables):
-            bridge.answer_bootstrap(variables)
+            self._bridge.namespace = bridge.answer_bootstrap(variables)
             return None
         code = _strip_code_fences(code)
+        flex_driver = rewrite.flex_driver(code) if self._bridge is not None else None
+        if flex_driver is not None:
+            # dspy.Flex runs its module with globals(), which Monty lacks.
+            code = rewrite.flex_driver_code(*flex_driver)
+            variables = {name: bridge.to_plain(value) for name, value in variables.items()}
+        elif self._bridge is not None:
+            self._bridge.functions.update(rewrite.functions(code))
+            code = rewrite.rewrite(code)
         code, raw_lookups = bridge.take_raw_variables(code, variables)
         variables = {name: bridge.to_monty(value) for name, value in variables.items()}
 
@@ -562,11 +749,16 @@ class MontyInterpreter:
         external_fns: dict[str, Callable[..., Any]] = {
             name: self._make_external_fn(name) for name in self._tools if not bridge.is_bridge_tool(name)
         }
+        external_fns.update(self._session_lookups())
         external_fns.update(raw_lookups)
         external_fns["SUBMIT"] = submit_fn
 
         session = self._ensure_session()
+        # Flex's driver and dspy's raw inputs use names only the host knows.
+        skip_type_check = flex_driver is not None or bool(raw_lookups)
         try:
+            if self._type_check and not skip_type_check:
+                self._declare_inputs(session, variables)
             result = session.feed_run(
                 code,
                 inputs=variables if variables else None,
@@ -574,9 +766,12 @@ class MontyInterpreter:
                 print_callback=print_callback,
                 mount=self._mounts,
                 os=self._os_access,
+                skip_type_check=skip_type_check,
             )
         except MontySyntaxError as e:
             raise SyntaxError(str(e)) from e
+        except MontyTypingError as e:
+            raise CodeExecutionError(f"Type check failed, so the code did not run:\n{e.display().strip()}") from e
         except MontyCrashedError as e:
             # The worker died (crash or request_timeout); the session and
             # its state are lost. Discard it so the next execute() checks
@@ -586,6 +781,13 @@ class MontyInterpreter:
                 args, kwargs = submit_box[0]
                 return _handle_submit(args, kwargs, self.output_fields)
             raise CodeInterpreterError(str(e)) from e
+        except (MontyDisconnectError, MontyRefusedError, MontyShutdown, MontyConnectError) as e:
+            # A remote server dropped or refused the session; its state is gone.
+            self._discard_session()
+            if submit_box:
+                args, kwargs = submit_box[0]
+                return _handle_submit(args, kwargs, self.output_fields)
+            raise CodeInterpreterError(f"{type(e).__name__}: {e}") from e
         except MontyRuntimeError as e:
             # SUBMIT halts by raising; honor the box whether the error is
             # that halt or a genuine error that fired after SUBMIT.
@@ -594,7 +796,12 @@ class MontyInterpreter:
                 args, kwargs = submit_box[0]
                 return _handle_submit(args, kwargs, self.output_fields)
             message = e.display("type-msg")
-            if _is_time_limit(e):
+            if m := _SUSPENSION_LIMIT_RE.search(message):
+                message += (
+                    f"; the sandbox allows at most {m.group(1)} calls to tools and llm_query per run, "
+                    "and every further call will fail. Batch the work instead, e.g. with llm_query_batched."
+                )
+            elif _is_time_limit(e):
                 # A feed or turn time limit stops the sandbox mid-operation
                 # and Monty makes no guarantees about its heap afterwards:
                 # discard the session so the next execute() starts clean.
@@ -603,15 +810,66 @@ class MontyInterpreter:
             raise CodeExecutionError(message) from e
 
         self._has_state = True
+        if self._type_check and not skip_type_check:
+            self._widen_assigned(session, code)
 
         if submit_box:
             args, kwargs = submit_box[0]
             return _handle_submit(args, kwargs, self.output_fields)
 
+        if flex_driver is not None:
+            return result  # {"fields": ...}, read by dspy.Flex on the host
         return _build_output(result, print_output)
+
+    def _type_stubs(self) -> str:
+        """Declarations of every host name sandbox code may use, for the checker."""
+        functions = {name: fn for name, fn in self._tools.items() if not bridge.is_bridge_tool(name)}
+        names: list[str] = []
+        if self._bridge is None:
+            return typecheck.stubs(functions)
+        if self._bridge.namespace is not None:
+            # dspy.Tool wraps the function whose signature the checker needs.
+            functions.update({name: getattr(t, "func", t) for name, t in self._bridge.provided_tools().items()})
+            names = list(self._bridge.custom_types())
+        return typecheck.stubs(functions, names, extra=bridge.PRELUDE_STUBS)
+
+    def _declare_inputs(self, session: MontySession, variables: dict[str, Any]) -> None:
+        """Declare input variables the checker has not seen, by type."""
+        declared: set[str] = self._thread_local.declared
+        new = {name: typecheck.value_annotation(v) for name, v in variables.items() if name not in declared}
+        if new:
+            session.feed_run(typecheck.declarations(new), print_callback=lambda *_: None)
+            declared.update(new)
+
+    def _widen_assigned(self, session: MontySession, code: str) -> None:
+        """Redeclare the names ``code`` assigned as ``Any``, so later snippets
+        may assign them values of other types."""
+        names = typecheck.assigned_names(code)
+        if names:
+            session.feed_run(
+                typecheck.declarations(dict.fromkeys(sorted(names), "Any")), print_callback=lambda *_: None
+            )
+
+    def _session_lookups(self) -> dict[str, Callable[..., Any]]:
+        """Names a dspy session adds to the sandbox: provided tools that dspy
+        serves itself (a Flex's), and the signature's custom types. A custom
+        type crosses back to the host as its name, which sub-agents resolve."""
+        if self._bridge is None or self._bridge.namespace is None:
+            return {}
+        lookups: dict[str, Callable[..., Any]] = {}
+        for name in self._bridge.session_tools():
+            lookups[name] = self._bridge.session_tool(name).func
+        for name in self._bridge.custom_types():
+            lookups.setdefault(name, _custom_type_stub(name))
+        return lookups
 
     @with_callbacks
     def shutdown(self) -> None:
+        if self._bridge is not None:
+            self._bridge.cancel_runs()
+        with self._lock:
+            sessions = list(self._live_sessions.values())
+        self._save_state(sessions)
         with self._lock:
             sessions = list(self._live_sessions.values())
             self._live_sessions.clear()
@@ -665,6 +923,13 @@ def _handle_submit(
     if len(args) == 0:
         return FinalOutput(None)
     return FinalOutput(args[0])
+
+
+def _custom_type_stub(name: str) -> Callable[..., Any]:
+    def stub(*_: Any, **__: Any) -> Any:
+        raise TypeError(f"{name} values are plain data in the sandbox: build a dict of its fields instead.")
+
+    return stub
 
 
 def _await_in_sync(awaitable: Any) -> Any:

@@ -23,13 +23,18 @@ classifiers = [
 ]
 dependencies = [
     "dspy>=3.4.0",
-    "pydantic-monty>=1.5.0",
+    "pydantic-monty>=1.6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "python-dotenv>=1.0",
+    "opentelemetry-sdk>=1.20",
+]
+# OpenTelemetry spans for execute() and dspy_monty_interpreter.instrument().
+telemetry = [
+    "opentelemetry-api>=1.20",
 ]
 # Live RLM scripts in scripts/, which send traces to cmpnd.
 scripts = [
