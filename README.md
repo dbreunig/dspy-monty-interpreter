@@ -292,6 +292,29 @@ from dspy_monty_interpreter import instrument
 instrument()  # uses the global OpenTelemetry providers
 ```
 
+### Filesystem access
+
+Monty's sandbox can read and write files when you opt in. Mount a host
+directory with `MountDir`, or supply an in-memory filesystem via `os_access`:
+
+```python
+from dspy_monty_interpreter import MontyInterpreter, MountDir
+
+# read-only host dir; "overlay" keeps writes in memory, leaving the host alone
+interp = MontyInterpreter(mounts=MountDir("/data", "/path/on/host", mode="read-only"))
+interp.execute("from pathlib import Path\nprint(Path('/data/notes.txt').read_text())")
+```
+
+## Examples
+
+See [`examples/`](examples/) for patterns built on top of the library:
+
+- [`examples/repo_rlm.py`](examples/repo_rlm.py) — `RepoRLM`, a `dspy.RLM`
+  specialized for analyzing one or more repositories. It mounts repos (local
+  checkouts or cloned from `owner/repo`) into Monty and surfaces them to the LLM
+  via a prompt manifest plus a `repos` REPL variable, so the model can read the
+  code and produce a report.
+
 ## Why Monty?
 
 - **Fast**: No WASM bootstrap. Code runs against a pool of warm `monty` worker processes
