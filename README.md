@@ -2,7 +2,7 @@
 
 DSPy `CodeInterpreter` implementation using [Monty](https://github.com/pydantic/monty), a secure Python interpreter written in Rust.
 
-Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `fnmatch`, `annotationlib`, `os.path`) and can't yet use generator functions (`yield`) or class inheritance. The adapter makes subclasses of `dspy.Module` and `dspy.Signature` work (see [dspy.Flex](#dspyflex)). It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
+Monty describes itself as "a sandbox for Python code written by AI." It implements a subset of the standard library (`sys`, `os`, `pathlib`, `typing`, `asyncio`, `re`, `datetime`, `time`, `random`, `json`, `math`, `unicodedata`, `collections`, `itertools`, `functools`, `dataclasses`, `copy`, `base64`, `binascii`, `csv`, `tomllib`, `hashlib`, `bisect`, `decimal`, `fnmatch`, `annotationlib`, `statistics`, `os.path`). It can't yet use generator functions (`yield`) or `super()`. Classes can inherit from classes defined in the sandbox but not from built-in types or exceptions. The adapter makes subclasses of `dspy.Module` and `dspy.Signature` work (see [dspy.Flex](#dspyflex)). It does support classes, `match` statements, decorators, `complex` numbers, `@dataclass` (including `frozen=` and `eq=`), generator expressions, `with`/context managers, and a sandboxed `open()` (file access is opt-in, see [Filesystem access](#filesystem-access)).
 
 That said: Monty is *fast*. For many RLM use cases, Monty is my daily driver.
 
@@ -175,7 +175,7 @@ flex = dspy.Flex("question -> answer", interpreter_factory=MontyInterpreter)
 result = flex(question="What is 2 + 2?")
 ```
 
-Monty has no class inheritance. The adapter therefore rewrites the module source before it runs. A `dspy.Module` subclass loses its base and its `super().__init__()` call and gains a `__call__` that runs `forward`. A `dspy.Signature` class becomes a signature the host builds from its field declarations. The rewrite keeps line numbers. Error messages therefore point at the code as written. Module code can call Flex tools by name. Values of the signature's custom types arrive as plain dicts. Every predictor call counts against `max_predictor_calls`.
+Monty has no `super()`. The adapter therefore rewrites the module source before it runs. A `dspy.Module` subclass loses its base and its `super().__init__()` call and gains a `__call__` that runs `forward`. A `dspy.Signature` class becomes a signature the host builds from its field declarations. The rewrite keeps line numbers. Error messages therefore point at the code as written. Module code can call Flex tools by name. Values of the signature's custom types arrive as plain dicts. Every predictor call counts against `max_predictor_calls`.
 
 GEPA's code proposer doesn't see the interpreter's limits. A proposed module may use a feature Monty lacks, such as `yield`. That candidate fails with an error, and GEPA's reflection reads the error.
 
@@ -263,7 +263,7 @@ Pass `remote` with the URL of a [`monty-server`](https://github.com/pydantic/mon
 interp_factory = MontyInterpreter.factory(remote="https://sandbox.internal:8799", request_timeout=30.0)
 ```
 
-Tools, `llm_query`, and sub-agents still run in your process, and the remote worker calls back to them. `request_timeout` and `max_processes` configure the remote pool. For other options, such as authentication metadata, pass a zero-argument callable that returns a `pydantic_monty.AsyncMontyRemote`. A dropped or refused connection raises `CodeInterpreterError`. RLM ends the run on that error.
+Tools, `llm_query`, and sub-agents still run in your process, and the remote worker calls back to them. `request_timeout`, `max_processes`, and `pre_warm` configure the remote pool. For other options, such as authentication metadata, pass a zero-argument callable that returns a `pydantic_monty.AsyncMontyRemote`. A dropped or refused connection raises `CodeInterpreterError`. RLM ends the run on that error.
 
 ## Parallel evaluation
 
@@ -278,7 +278,7 @@ evaluate = dspy.Evaluate(devset=devset, num_threads=8, metric=metric)
 evaluate(rlm)
 ```
 
-A pool starts its worker lazily on the first `execute()`, in a few milliseconds, so per-forward pools cost little. `max_processes` only matters when you drive one interpreter instance from several threads yourself, outside RLM: sessions are per-thread and share that instance's pool, and a thread holds its worker between `execute()` calls, so set `max_processes` to at least the thread count.
+A pool starts its worker lazily on the first `execute()`, in a few milliseconds, so per-forward pools cost little. `max_processes` only matters when you drive one interpreter instance from several threads yourself, outside RLM: sessions are per-thread and share that instance's pool, and a thread holds its worker between `execute()` calls, so set `max_processes` to at least the thread count. Pass `pre_warm` to keep that many idle workers ready beyond those checked out. A thread's first `execute()` then takes a ready worker instead of starting one. Pre-warmed workers count against `max_processes`.
 
 ## Observability
 

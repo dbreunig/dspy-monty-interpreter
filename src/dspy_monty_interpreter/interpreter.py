@@ -63,10 +63,10 @@ _AVAILABLE_STDLIB = (
     "re", "json", "math", "datetime", "time", "random", "collections", "itertools",
     "functools", "dataclasses", "copy", "base64", "binascii", "typing", "sys", "os",
     "os.path", "pathlib", "asyncio", "unicodedata", "csv", "tomllib", "hashlib",
-    "bisect", "decimal", "fnmatch", "annotationlib",
+    "bisect", "decimal", "fnmatch", "annotationlib", "statistics",
 )
 # Common stdlib modules Monty lacks, named so the model stops reaching for them.
-_UNAVAILABLE_STDLIB_EXAMPLES = ("statistics", "io", "operator", "string", "heapq", "enum")
+_UNAVAILABLE_STDLIB_EXAMPLES = ("io", "operator", "string", "heapq", "enum")
 
 _BASE_EXECUTION_INSTRUCTIONS = (
     "Python runs in Monty, a sandboxed interpreter written in Rust, not CPython. "
@@ -78,10 +78,11 @@ _BASE_EXECUTION_INSTRUCTIONS = (
     "third-party packages (numpy, pandas, requests, ...) are NOT available; there is no pip. "
     "There is no network access, no subprocesses, and no environment variables; "
     "datetime.now() and time.time() do work. "
-    "Supported syntax includes classes, decorators, @dataclass, complex numbers, comprehensions, "
-    "generator expressions, lambdas, with statements, try/except, and match statements; "
-    "generator functions (yield) are NOT supported, nor are class inheritance "
-    "(including subclassing Exception), or a callable replacement in re.sub(). "
+    "Supported syntax includes classes, inheritance from classes you define, decorators, "
+    "@dataclass, complex numbers, comprehensions, generator expressions, lambdas, with statements, "
+    "try/except, and match statements; generator functions (yield) are NOT supported, nor are "
+    "super(), subclassing built-in types or exceptions (class E(Exception) fails), or a callable "
+    "replacement in re.sub(). "
     "Methods of built-in types cannot be passed as values: max(d, key=d.get) and "
     "sorted(items, key=str.lower) fail with AttributeError. Call them instead, e.g. "
     "max(d, key=lambda k: d[k]) or max(d.items(), key=lambda kv: kv[1]). "
@@ -417,7 +418,10 @@ class MontyInterpreter:
     ``forward()`` is the right default even under ``dspy.Evaluate``. If you
     drive one instance from several threads yourself, each thread gets its
     own isolated session on the shared pool; pass ``max_processes`` when
-    the thread count exceeds your CPU count.
+    the thread count exceeds your CPU count. Pass ``pre_warm`` to keep that
+    many idle workers ready beyond those checked out, so a new thread's
+    first ``execute()`` does not wait for a worker to start; they count
+    against ``max_processes``.
 
     Tools may be coroutine functions: ``invoke_tool`` awaits their result,
     also when ``execute()`` runs inside an event loop (``RLM.acall``).
@@ -453,6 +457,7 @@ class MontyInterpreter:
         type_check: bool = False,
         state: SessionState | None = None,
         remote: str | Callable[[], Any] | None = None,
+        pre_warm: int = 0,
     ) -> None:
         self._tools: dict[str, Callable[..., str]] = dict(tools) if tools else {}
         self.output_fields: list[dict] | None = output_fields
@@ -468,6 +473,7 @@ class MontyInterpreter:
         self._os_policy: OSPolicy = {**_DEFAULT_OS_POLICY, **(os_policy or {})}
         self._request_timeout: float | None = request_timeout
         self._max_processes: int | None = max_processes
+        self._pre_warm = pre_warm
         self._type_check = type_check
         self._state = state
         self._remote = remote
@@ -572,7 +578,9 @@ class MontyInterpreter:
     def _make_pool(self) -> Any:
         """A local subprocess pool, or a sync facade over a remote one."""
         if self._remote is None:
-            return Monty(request_timeout=self._request_timeout, max_processes=self._max_processes)
+            return Monty(
+                request_timeout=self._request_timeout, max_processes=self._max_processes, pre_warm=self._pre_warm
+            )
         if callable(self._remote):
             return remote.SyncPool(self._remote)
         options: dict[str, Any] = {}
@@ -580,6 +588,8 @@ class MontyInterpreter:
             options["request_timeout"] = self._request_timeout
         if self._max_processes is not None:
             options["max_processes"] = self._max_processes
+        if self._pre_warm:
+            options["pre_warm"] = self._pre_warm
         url = self._remote
         return remote.SyncPool(lambda: AsyncMontyRemote(url, **options))
 

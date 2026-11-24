@@ -8,12 +8,11 @@ version = "0.7.0"
 description = "DSPy CodeInterpreter implementation using Monty, a secure Python interpreter written in Rust"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "dspy>=3.4.0",
-    "pydantic-monty>=1.6.0",
+    "pydantic-monty>=1.7.0",
 ]
 
 [project.optional-dependencies]
@@ -53,7 +52,7 @@ packages = ["src/dspy_monty_interpreter"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 extend-exclude = ["tmp"]
 
 [tool.ruff.lint]

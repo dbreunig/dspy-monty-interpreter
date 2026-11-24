@@ -1,6 +1,6 @@
 """Source rewrites that let dspy code run in Monty.
 
-Monty has no class inheritance, no ``super()`` and no ``dspy`` package. The
+Monty has no ``super()`` and no ``dspy`` package. The
 sandbox gets a ``dspy`` namespace from the bridge's prelude instead, so code
 that imports dspy, subclasses ``dspy.Module`` or declares a
 ``dspy.Signature`` class is rewritten before it runs:

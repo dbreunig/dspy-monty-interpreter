@@ -29,8 +29,8 @@ def test_execution_instructions_describe_monty_limitations():
     assert "network" in text
     # Monty cannot pass builtin methods as values (max(d, key=d.get) fails).
     assert "key=d.get" in text
-    assert " annotationlib." in text
-    assert "statistics" in text
+    assert " annotationlib," in text
+    assert " statistics." in text
     # Monty 1.0 additions and long-standing syntax gaps.
     for mod in ("random", "time", "copy", "pathlib"):
         assert f" {mod}," in text or f" {mod}." in text
@@ -279,8 +279,19 @@ _SYNTAX_CLAIMS = [
     ("datetime.now()", "import datetime\ndatetime.datetime.now() is not None", None),
     ("time.time()", "import time\ntime.time() > 0", None),
     ("generator functions (yield)", "def g():\n    yield 1\nlist(g())", "NotImplementedError"),
-    ("class inheritance", "class A:\n    pass\nclass B(A):\n    pass", "NotImplementedError"),
-    ("subclassing Exception", "class E(Exception):\n    pass", "NotImplementedError"),
+    (
+        "inheritance from classes you define",
+        "class A:\n    def f(self):\n        return 1\nclass B(A):\n    pass\nB().f()",
+        None,
+    ),
+    (
+        "super()",
+        "class A:\n    def __init__(self):\n        pass\nclass B(A):\n    def __init__(self):\n"
+        "        super().__init__()\nB()",
+        "NameError",
+    ),
+    ("subclassing built-in types", "class D(dict):\n    pass", "TypeError"),
+    ("class E(Exception) fails", "class E(Exception):\n    pass", "TypeError"),
     ("callable replacement in re.sub()", "import re\nre.sub('a', lambda m: 'b', 'a')", "TypeError"),
     ("max(d, key=d.get)", "d = {'a': 1}\nmax(d, key=d.get)", "AttributeError"),
     ("sorted(items, key=str.lower)", "sorted(['b', 'A'], key=str.lower)", "AttributeError"),

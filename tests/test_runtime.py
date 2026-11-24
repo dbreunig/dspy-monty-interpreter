@@ -376,3 +376,31 @@ def test_suspension_limit_message_explains_cap():
     interp.execute("y = 2")
     assert interp.execute("print(y)") == "2"
     interp.shutdown()
+
+
+def test_pre_warm_passes_to_local_pool():
+    interp = MontyInterpreter(pre_warm=2, max_processes=3)
+    try:
+        assert interp.execute("1 + 1") == "2"
+    finally:
+        interp.shutdown()
+
+
+def test_pre_warm_above_max_processes_is_rejected():
+    from pydantic_monty import MontyConfigurationError
+
+    interp = MontyInterpreter(pre_warm=3, max_processes=1)
+    try:
+        with pytest.raises(MontyConfigurationError, match="pre_warm=3"):
+            interp.execute("1")
+    finally:
+        interp.shutdown()
+
+
+def test_pre_warm_passes_to_remote_pool(monkeypatch):
+    from dspy_monty_interpreter import interpreter as interpreter_module
+
+    seen = {}
+    monkeypatch.setattr(interpreter_module, "AsyncMontyRemote", lambda url, **kw: seen.update(url=url, **kw))
+    MontyInterpreter(remote="http://sandbox:8799", pre_warm=2)._make_pool()._make_pool()
+    assert seen == {"url": "http://sandbox:8799", "pre_warm": 2}
